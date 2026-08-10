@@ -8,12 +8,12 @@ use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args = args_parser::Args::parse();
+    // let args = args_parser::Args::parse();
 
     let bytes = b"i43e";
-    // println!("{:?}", String::from_utf8(bytes.to_vec()));
+    println!("{:?}", String::from_utf8(bytes.to_vec()));
     
-    // match fss(&args) {
+    // match fs_operate(&args) {
     //     Ok(bytes) => {
     //         bencode_parser::parse(&bytes, 0);
     //         ExitCode::SUCCESS
@@ -27,7 +27,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn fss(args: &args_parser::Args) -> Result<Vec<u8>> {
+fn fs_operate(args: &args_parser::Args) -> Result<Vec<u8>> {
     let path = Path::new(&args.path);
     if !path.is_file() {
         let e = anyhow!("Файл не знайдено!");
