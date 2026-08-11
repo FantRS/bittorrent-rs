@@ -10,6 +10,15 @@ pub enum BencodeValue {
     Dict(BTreeMap<Vec<u8>, BencodeValue>),
 }
 
+impl BencodeValue {
+    pub fn get<K>(&self, _key: K) -> String
+    where
+        K: ToString,
+    {
+        "".into()
+    }
+}
+
 pub struct BencodeParser {
     bytes: Vec<u8>,
     cursor: usize,
@@ -17,104 +26,128 @@ pub struct BencodeParser {
 
 impl BencodeParser {
     pub fn new(bytes: Vec<u8>) -> Self {
-        BencodeParser {
-            bytes,
-            cursor: 0,
-        }
+        BencodeParser { bytes, cursor: 0 }
     }
 
     pub fn parse(&mut self) -> Result<BencodeValue> {
-        Self::parse_dict(self)
+        self.parse_dict()
     }
 
-    /// ЧИСЛО: *`i<value>e`* (*`i42e`* - 42, *`i0e`* - 0, *`i-21e`* - -21)
-    pub fn parse_int(&mut self) -> Result<BencodeValue> {
-        let mut value: Vec<u8> = Vec::new();
+    fn read_until(&mut self, terminator: u8) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        while let Some(&byte) = self.bytes.get(self.cursor) {
+            self.cursor += 1;
+            if byte == terminator {
+                return Ok(buf);
+            }
+            buf.push(byte);
+        }
+
+        Err(anyhow!(
+            "Unexpected end of input, expected '{}'",
+            terminator as char
+        ))
+    }
+
+    fn parse_delimited(
+        &mut self,
+        open: u8,
+        mut on_item: impl FnMut(&mut Self, u8) -> Result<()>,
+    ) -> Result<()> {
+        let mut is_start = true;
         let mut is_end = false;
 
-        while let Some(byte) = self.bytes.get(self.cursor) {
-            self.cursor += 1;
-
+        while let Some(&byte) = self.bytes.get(self.cursor) {
             match byte {
-                b'i' => continue,
+                b if b == open && is_start => {
+                    self.cursor += 1;
+                    is_start = false;
+                }
                 b'e' => {
+                    self.cursor += 1;
                     is_end = true;
                     break;
-                },
-                _ => value.push(*byte)
+                }
+                _ => on_item(self, byte)?,
             }
         }
 
         if !is_end {
-            return Err(anyhow!("Integer not terminated with 'e'"));
+            return Err(anyhow!("Value not terminated with 'e'"));
         }
 
-        let res: i64 = String::from_utf8(value)?.parse()?;
-        Ok(BencodeValue::Int(res))
-
+        Ok(())
     }
 
-    /// СТРОКА БАЙТ: *`<len>:<value>`* (*`4:spam`* - spam, *`3:gay`* - gay)
-    pub fn parse_bytes(&mut self) -> Result<BencodeValue> {
-        let mut len: Vec<u8> = Vec::new();
-        let mut is_terminated = false;
+    /// ЧИСЛО: `i<value>e`
+    fn parse_int(&mut self) -> Result<BencodeValue> {
+        self.cursor += 1;
+        let raw = self.read_until(b'e')?;
+        let n: i64 = String::from_utf8(raw)?.parse()?;
 
-        while let Some(byte) = self.bytes.get(self.cursor) {
-            self.cursor += 1;
+        Ok(BencodeValue::Int(n))
+    }
 
-            match byte {
-                b'0'..=b'9' => len.push(*byte),
-                b':' => {
-                    is_terminated = true;
-                    break;
-                },
-                _ => return Err(anyhow!("Invalid byte string length"))
-            }
-        }
-
-        if !is_terminated {
-            return Err(anyhow!("Byte string length not terminated with ':'"));
-        }
-
-        let len: usize = String::from_utf8(len)?.parse()?;
-        let value = self.bytes.get(self.cursor..self.cursor + len).ok_or_else(|| anyhow!("Invalid byte string"))?.to_vec();
+    /// СТРОКА БАЙТ: `<len>:<value>`
+    fn parse_bytes(&mut self) -> Result<BencodeValue> {
+        let raw = self.read_until(b':')?;
+        let len: usize = String::from_utf8(raw)?.parse()?;
+        let value = self
+            .bytes
+            .get(self.cursor..self.cursor + len)
+            .ok_or_else(|| anyhow!("Invalid byte string"))?
+            .to_vec();
         self.cursor += len;
 
         Ok(BencodeValue::Bytes(value))
     }
 
-    /// СПИСОК: *`l<value>e`* (*`l4:spami42ee`* - spam42)
-    pub fn parse_list(&mut self) -> Result<BencodeValue> {
-        let value: Vec<BencodeValue> = Vec::new();
+    /// СПИСОК: `l<value>e`
+    fn parse_list(&mut self) -> Result<BencodeValue> {
+        let mut value = Vec::new();
 
-        while let Some(byte) = self.bytes.get(self.cursor) {
-            self.cursor += 1;
+        self.parse_delimited(b'l', |p, byte| {
+            value.push(p.parse_by_type(byte)?);
 
-            match byte {
-                b'l' => continue,
-                b'e' => break,
-                _ => {
-                    self._define_type(*byte);
-                }
-            }
+            Ok(())
+        })?;
+
+        Ok(BencodeValue::List(value))
+    }
+
+    /// СЛОВНИК: `d<value>e`
+    fn parse_dict(&mut self) -> Result<BencodeValue> {
+        let mut value = BTreeMap::new();
+
+        self.parse_delimited(b'd', |p, _byte| {
+            let key = match p.parse_bytes()? {
+                BencodeValue::Bytes(k) => k,
+                _ => return Err(anyhow!("Dictionary key must be a byte string")),
+            };
+
+            let inner_byte = *p
+                .bytes
+                .get(p.cursor)
+                .ok_or_else(|| anyhow!("Unexpected end of input while reading dictionary value"))?;
+
+            let val = p.parse_by_type(inner_byte)?;
+            value.insert(key, val);
+
+            Ok(())
+        })?;
+
+        Ok(BencodeValue::Dict(value))
+    }
+
+    fn parse_by_type(&mut self, byte: u8) -> Result<BencodeValue> {
+        match byte {
+            b'0'..=b'9' => self.parse_bytes(),
+            b'i' => self.parse_int(),
+            b'l' => self.parse_list(),
+            b'd' => self.parse_dict(),
+            _ => Err(anyhow!("Unknown type")),
         }
-
-        Ok(BencodeValue::List(Vec::new()))
-    }
-
-    /// СЛОВНИК: *`d<value>e`* (*`d3:bar4:spam3:fooi42ee`* - { bar:spam, foo:42 })
-    pub fn parse_dict(&mut self) -> Result<BencodeValue> {
-        Ok(BencodeValue::Dict(BTreeMap::new()))
-    }
-
-    fn _define_type(&mut self, byte: u8) {
-        _ = match byte {
-            b'i' => Self::parse_int(self),
-            b'l' => Self::parse_list(self),
-            b'd' => Self::parse_dict(self),
-            b'0'..=b'9' => Self::parse_bytes(self),
-            _ => Err(anyhow!("Unknown type"))
-        };
     }
 }
 
@@ -146,7 +179,10 @@ mod tests {
     fn parse_bytes_cases() {
         // звичайний рядок
         let mut p = BencodeParser::new(b"4:spam".to_vec());
-        assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(b"spam".to_vec()));
+        assert_eq!(
+            p.parse_bytes().unwrap(),
+            BencodeValue::Bytes(b"spam".to_vec())
+        );
         assert_eq!(p.cursor, 6);
 
         // порожній рядок
@@ -156,11 +192,17 @@ mod tests {
 
         // довжина з кількох цифр
         let mut p = BencodeParser::new(b"10:0123456789".to_vec());
-        assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(b"0123456789".to_vec()));
+        assert_eq!(
+            p.parse_bytes().unwrap(),
+            BencodeValue::Bytes(b"0123456789".to_vec())
+        );
 
         // бінарні (не-UTF8) байти
         let mut p = BencodeParser::new(vec![b'4', b':', 0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert_eq!(
+            p.parse_bytes().unwrap(),
+            BencodeValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
 
         // помилка: немає роздільника ':'
         let mut p = BencodeParser::new(b"4spam".to_vec());
@@ -177,6 +219,97 @@ mod tests {
 
     #[test]
     fn parse_list_cases() {
-        assert!(true);
+        // порожній список
+        let mut p = BencodeParser::new(b"le".to_vec());
+        assert_eq!(p.parse_list().unwrap(), BencodeValue::List(vec![]));
+
+        // список зі змішаними типами
+        let mut p = BencodeParser::new(b"l4:spami42ee".to_vec());
+        assert_eq!(
+            p.parse_list().unwrap(),
+            BencodeValue::List(vec![
+                BencodeValue::Bytes(b"spam".to_vec()),
+                BencodeValue::Int(42),
+            ])
+        );
+
+        // вкладений список
+        let mut p = BencodeParser::new(b"ll4:spamee".to_vec());
+        assert_eq!(
+            p.parse_list().unwrap(),
+            BencodeValue::List(vec![BencodeValue::List(vec![BencodeValue::Bytes(
+                b"spam".to_vec()
+            )])])
+        );
+
+        // список списків з числами
+        let mut p = BencodeParser::new(b"lli1ei2eeli3ei4eee".to_vec());
+        assert_eq!(
+            p.parse_list().unwrap(),
+            BencodeValue::List(vec![
+                BencodeValue::List(vec![BencodeValue::Int(1), BencodeValue::Int(2)]),
+                BencodeValue::List(vec![BencodeValue::Int(3), BencodeValue::Int(4)]),
+            ])
+        );
+
+        // курсор просунувся рівно до кінця вхідних байтів
+        let mut p = BencodeParser::new(b"l4:spame".to_vec());
+        p.parse_list().unwrap();
+        assert_eq!(p.cursor, 8);
+
+        // помилка: список без завершального 'e'
+        let mut p = BencodeParser::new(b"l4:spam".to_vec());
+        assert!(p.parse_list().is_err());
+
+        // помилка: обірваний елемент всередині списку
+        let mut p = BencodeParser::new(b"l4:sp".to_vec());
+        assert!(p.parse_list().is_err());
+
+        // помилка: невідомий тип елемента
+        let mut p = BencodeParser::new(b"lxe".to_vec());
+        assert!(p.parse_list().is_err());
+    }
+
+    #[test]
+    fn parse_dict_cases() {
+        // порожній словник
+        let mut p = BencodeParser::new(b"de".to_vec());
+        assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(BTreeMap::new()));
+
+        // простий словник з двома різнотипними значеннями
+        let mut p = BencodeParser::new(b"d3:bar4:spam3:fooi42ee".to_vec());
+        let mut expected = BTreeMap::new();
+        expected.insert(b"bar".to_vec(), BencodeValue::Bytes(b"spam".to_vec()));
+        expected.insert(b"foo".to_vec(), BencodeValue::Int(42));
+        assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
+
+        // вкладений словник як значення
+        let mut p = BencodeParser::new(b"d3:food3:bar3:bazee".to_vec());
+        let mut inner = BTreeMap::new();
+        inner.insert(b"bar".to_vec(), BencodeValue::Bytes(b"baz".to_vec()));
+        let mut expected = BTreeMap::new();
+        expected.insert(b"foo".to_vec(), BencodeValue::Dict(inner));
+        assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
+
+        // список як значення (наближено до реального .torrent, поле "files")
+        let mut p = BencodeParser::new(b"d5:filesli1ei2eee".to_vec());
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            b"files".to_vec(),
+            BencodeValue::List(vec![BencodeValue::Int(1), BencodeValue::Int(2)]),
+        );
+        assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
+
+        // помилка: ключ не byte string
+        let mut p = BencodeParser::new(b"di42e4:spame".to_vec());
+        assert!(p.parse_dict().is_err());
+
+        // помилка: значення відсутнє (обірвано одразу після ключа)
+        let mut p = BencodeParser::new(b"d3:fooe".to_vec());
+        assert!(p.parse_dict().is_err());
+
+        // помилка: словник без завершального 'e'
+        let mut p = BencodeParser::new(b"d3:foo3:bar".to_vec());
+        assert!(p.parse_dict().is_err());
     }
 }

@@ -8,23 +8,22 @@ use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    // let args = args_parser::Args::parse();
+    let args = args_parser::Args::parse();
 
-    let bytes = b"i43e";
-    println!("{:?}", String::from_utf8(bytes.to_vec()));
-    
-    // match fs_operate(&args) {
-    //     Ok(bytes) => {
-    //         bencode_parser::parse(&bytes, 0);
-    //         ExitCode::SUCCESS
-    //     },
-    //     Err(e) => {
-    //         eprintln!("{}", e);
-    //         ExitCode::FAILURE
-    //     }
-    // }
+    match fs_operate(&args) {
+        Ok(bytes) => {
+            let mut parser = bencode_parser::BencodeParser::new(bytes);
+            let parse_result = parser.parse().unwrap();
 
-    ExitCode::SUCCESS
+            println!("{:?}", parse_result);
+
+            ExitCode::SUCCESS
+        },
+        Err(e) => {
+            eprintln!("{}", e);
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn fs_operate(args: &args_parser::Args) -> Result<Vec<u8>> {
@@ -37,9 +36,6 @@ fn fs_operate(args: &args_parser::Args) -> Result<Vec<u8>> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut file = File::open(path).unwrap();
     file.read_to_end(&mut bytes).unwrap();
-
-    println!("Прочитано байтів: {}", bytes.len());
-    println!("Byte: {:?}", bytes.first());
 
     Ok(bytes)
 }
