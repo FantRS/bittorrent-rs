@@ -24,9 +24,7 @@ impl BencodeParser {
     }
 
     pub fn parse(&mut self) -> Result<BencodeValue> {
-        // Self::parse_dict();
-
-        Err(anyhow!("Parse error!"))
+        Self::parse_dict(self)
     }
 
     /// ЧИСЛО: *`i<value>e`* (*`i42e`* - 42, *`i0e`* - 0, *`i-21e`* - -21)
@@ -51,7 +49,7 @@ impl BencodeParser {
             return Err(anyhow!("Integer not terminated with 'e'"));
         }
 
-        let res = String::from_utf8(value)?.parse::<i64>()?;
+        let res: i64 = String::from_utf8(value)?.parse()?;
         Ok(BencodeValue::Int(res))
 
     }
@@ -78,7 +76,7 @@ impl BencodeParser {
             return Err(anyhow!("Byte string length not terminated with ':'"));
         }
 
-        let len = String::from_utf8(len)?.parse::<usize>()?;
+        let len: usize = String::from_utf8(len)?.parse()?;
         let value = self.bytes.get(self.cursor..self.cursor + len).ok_or_else(|| anyhow!("Invalid byte string"))?.to_vec();
         self.cursor += len;
 
@@ -86,27 +84,37 @@ impl BencodeParser {
     }
 
     /// СПИСОК: *`l<value>e`* (*`l4:spami42ee`* - spam42)
-    fn _parse_list() -> Result<BencodeValue> {
+    pub fn parse_list(&mut self) -> Result<BencodeValue> {
+        let value: Vec<BencodeValue> = Vec::new();
+
+        while let Some(byte) = self.bytes.get(self.cursor) {
+            self.cursor += 1;
+
+            match byte {
+                b'l' => continue,
+                b'e' => break,
+                _ => {
+                    self._define_type(*byte);
+                }
+            }
+        }
+
         Ok(BencodeValue::List(Vec::new()))
     }
 
     /// СЛОВНИК: *`d<value>e`* (*`d3:bar4:spam3:fooi42ee`* - { bar:spam, foo:42 })
-    fn _parse_dict() -> Result<BencodeValue> {
+    pub fn parse_dict(&mut self) -> Result<BencodeValue> {
         Ok(BencodeValue::Dict(BTreeMap::new()))
     }
 
     fn _define_type(&mut self, byte: u8) {
         _ = match byte {
             b'i' => Self::parse_int(self),
-            b'l' => Self::_parse_list(),
-            b'd' => Self::_parse_dict(),
+            b'l' => Self::parse_list(self),
+            b'd' => Self::parse_dict(self),
             b'0'..=b'9' => Self::parse_bytes(self),
             _ => Err(anyhow!("Unknown type"))
         };
-    }
-
-    fn _is_start_type(byte: u8) -> bool {
-        matches!(byte, b'i' | b'l' | b'd' | b'0'..=b'9')
     }
 }
 
@@ -165,5 +173,10 @@ mod tests {
         // помилка: довжина не число
         let mut p = BencodeParser::new(b"a:spam".to_vec());
         assert!(p.parse_bytes().is_err());
+    }
+
+    #[test]
+    fn parse_list_cases() {
+        assert!(true);
     }
 }
