@@ -1,23 +1,8 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::{ Result, anyhow };
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum BencodeValue {
-    Int(i64),
-    Bytes(Vec<u8>),
-    List(Vec<BencodeValue>),
-    Dict(BTreeMap<Vec<u8>, BencodeValue>),
-}
-
-impl BencodeValue {
-    pub fn get<K>(&self, _key: K) -> String
-    where
-        K: ToString,
-    {
-        "".into()
-    }
-}
+use crate::bencode::BencodeValue;
 
 pub struct BencodeParser {
     bytes: Vec<u8>,
@@ -44,16 +29,13 @@ impl BencodeParser {
             buf.push(byte);
         }
 
-        Err(anyhow!(
-            "Unexpected end of input, expected '{}'",
-            terminator as char
-        ))
+        Err(anyhow!("Unexpected end of input, expected '{}'", terminator as char))
     }
 
     fn parse_delimited(
         &mut self,
         open: u8,
-        mut on_item: impl FnMut(&mut Self, u8) -> Result<()>,
+        mut on_item: impl FnMut(&mut Self, u8) -> Result<()>
     ) -> Result<()> {
         let mut is_start = true;
         let mut is_end = false;
@@ -93,8 +75,7 @@ impl BencodeParser {
     fn parse_bytes(&mut self) -> Result<BencodeValue> {
         let raw = self.read_until(b':')?;
         let len: usize = String::from_utf8(raw)?.parse()?;
-        let value = self
-            .bytes
+        let value = self.bytes
             .get(self.cursor..self.cursor + len)
             .ok_or_else(|| anyhow!("Invalid byte string"))?
             .to_vec();
@@ -123,11 +104,12 @@ impl BencodeParser {
         self.parse_delimited(b'd', |p, _byte| {
             let key = match p.parse_bytes()? {
                 BencodeValue::Bytes(k) => k,
-                _ => return Err(anyhow!("Dictionary key must be a byte string")),
+                _ => {
+                    return Err(anyhow!("Dictionary key must be a byte string"));
+                }
             };
 
-            let inner_byte = *p
-                .bytes
+            let inner_byte = *p.bytes
                 .get(p.cursor)
                 .ok_or_else(|| anyhow!("Unexpected end of input while reading dictionary value"))?;
 
@@ -179,10 +161,7 @@ mod tests {
     fn parse_bytes_cases() {
         // звичайний рядок
         let mut p = BencodeParser::new(b"4:spam".to_vec());
-        assert_eq!(
-            p.parse_bytes().unwrap(),
-            BencodeValue::Bytes(b"spam".to_vec())
-        );
+        assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(b"spam".to_vec()));
         assert_eq!(p.cursor, 6);
 
         // порожній рядок
@@ -192,17 +171,11 @@ mod tests {
 
         // довжина з кількох цифр
         let mut p = BencodeParser::new(b"10:0123456789".to_vec());
-        assert_eq!(
-            p.parse_bytes().unwrap(),
-            BencodeValue::Bytes(b"0123456789".to_vec())
-        );
+        assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(b"0123456789".to_vec()));
 
         // бінарні (не-UTF8) байти
-        let mut p = BencodeParser::new(vec![b'4', b':', 0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(
-            p.parse_bytes().unwrap(),
-            BencodeValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
-        );
+        let mut p = BencodeParser::new(vec![b'4', b':', 0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
 
         // помилка: немає роздільника ':'
         let mut p = BencodeParser::new(b"4spam".to_vec());
@@ -227,29 +200,28 @@ mod tests {
         let mut p = BencodeParser::new(b"l4:spami42ee".to_vec());
         assert_eq!(
             p.parse_list().unwrap(),
-            BencodeValue::List(vec![
-                BencodeValue::Bytes(b"spam".to_vec()),
-                BencodeValue::Int(42),
-            ])
+            BencodeValue::List(vec![BencodeValue::Bytes(b"spam".to_vec()), BencodeValue::Int(42)])
         );
 
         // вкладений список
         let mut p = BencodeParser::new(b"ll4:spamee".to_vec());
         assert_eq!(
             p.parse_list().unwrap(),
-            BencodeValue::List(vec![BencodeValue::List(vec![BencodeValue::Bytes(
-                b"spam".to_vec()
-            )])])
+            BencodeValue::List(
+                vec![BencodeValue::List(vec![BencodeValue::Bytes(b"spam".to_vec())])]
+            )
         );
 
         // список списків з числами
         let mut p = BencodeParser::new(b"lli1ei2eeli3ei4eee".to_vec());
         assert_eq!(
             p.parse_list().unwrap(),
-            BencodeValue::List(vec![
-                BencodeValue::List(vec![BencodeValue::Int(1), BencodeValue::Int(2)]),
-                BencodeValue::List(vec![BencodeValue::Int(3), BencodeValue::Int(4)]),
-            ])
+            BencodeValue::List(
+                vec![
+                    BencodeValue::List(vec![BencodeValue::Int(1), BencodeValue::Int(2)]),
+                    BencodeValue::List(vec![BencodeValue::Int(3), BencodeValue::Int(4)])
+                ]
+            )
         );
 
         // курсор просунувся рівно до кінця вхідних байтів
@@ -296,7 +268,7 @@ mod tests {
         let mut expected = BTreeMap::new();
         expected.insert(
             b"files".to_vec(),
-            BencodeValue::List(vec![BencodeValue::Int(1), BencodeValue::Int(2)]),
+            BencodeValue::List(vec![BencodeValue::Int(1), BencodeValue::Int(2)])
         );
         assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
 

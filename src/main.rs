@@ -1,18 +1,18 @@
-use bittorrent_rs::*;
-use clap::Parser;
-use anyhow::{Result, anyhow};
-
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
+
+use bittorrent_rs::*;
+use clap::Parser;
+use anyhow::{Result, anyhow};
 
 fn main() -> ExitCode {
     let args = args_parser::Args::parse();
 
     match fs_operate(&args) {
         Ok(bytes) => {
-            let mut parser = bencode_parser::BencodeParser::new(bytes);
+            let mut parser = bencode::BencodeParser::new(bytes);
             let parse_result = parser.parse().unwrap();
 
             println!("{:?}", parse_result);
