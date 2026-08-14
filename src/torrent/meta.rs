@@ -6,6 +6,7 @@ use crate::bencode::BencodeValue;
 pub struct TorrentMeta {
     pub announce: String,
     pub info: TorrentInfo,
+    pub info_hash: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -16,12 +17,21 @@ pub struct TorrentInfo {
     pub length: i64,
 }
 
+impl TorrentMeta {
+    pub fn with_hash<I>(&mut self, bytes: I)
+    where
+        I: IntoIterator<Item = u8>
+    {
+        let bytes: Vec<u8> = bytes.into_iter().collect();
+        // let hash = 
+        
+    }
+}
+
 impl TryFrom<BencodeValue> for TorrentMeta {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        
-
         if let BencodeValue::Dict(dict) = value {
             let announce = dict
                 .get(&b"announce".to_vec())
@@ -33,8 +43,9 @@ impl TryFrom<BencodeValue> for TorrentMeta {
 
             let announce: String = (*announce).clone().try_into()?;
             let info: TorrentInfo = (*info_value).clone().try_into()?;
+            let info_hash: Option<Vec<u8>> = None;
 
-            Ok(TorrentMeta { announce, info })
+            Ok(TorrentMeta { announce, info, info_hash })
         } else {
             Err(anyhow!("Expected a dictionary for MetaInfo"))
         }

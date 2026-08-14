@@ -6,15 +6,26 @@ use crate::bencode::BencodeValue;
 pub struct BencodeParser {
     bytes: Vec<u8>,
     cursor: usize,
+
+    fdict: bool,
+    start_hash: Option<usize>,
+    end_hash: Option<usize>,
 }
 
 impl BencodeParser {
     pub fn new(bytes: Vec<u8>) -> Self {
-        BencodeParser { bytes, cursor: 0 }
+        BencodeParser { bytes, cursor: 0, fdict: false, start_hash: None, end_hash: None }
     }
 
     pub fn parse(&mut self) -> Result<BencodeValue> {
         self.parse_dict()
+    }
+
+    pub fn get_hash(&self) -> Option<Vec<u8>> {
+        let start = self.start_hash?;
+        let end = self.end_hash?;
+
+        self.bytes.get(start..=end).map(ToOwned::to_owned)
     }
 
     fn read_until(&mut self, terminator: u8) -> Result<Vec<u8>> {
