@@ -1,5 +1,5 @@
-use std::{ collections::BTreeMap };
-use anyhow::{ Result, anyhow };
+use anyhow::{Result, anyhow};
+use std::collections::BTreeMap;
 
 use crate::torrent::TorrentMeta;
 
@@ -44,8 +44,9 @@ impl TryFrom<BencodeValue> for String {
 
     fn try_from(value: BencodeValue) -> Result<Self> {
         match value {
-            BencodeValue::Bytes(bytes) =>
-                String::from_utf8(bytes).map_err(|e| anyhow!("Invalid UTF-8 string: {}", e)),
+            BencodeValue::Bytes(bytes) => {
+                String::from_utf8(bytes).map_err(|e| anyhow!("Invalid UTF-8 string: {}", e))
+            }
             _ => Err(anyhow!("Expected a byte string, got {:?}", value)),
         }
     }

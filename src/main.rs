@@ -3,9 +3,9 @@ use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 
+use anyhow::{Result, anyhow};
 use bittorrent_rs::*;
 use clap::Parser;
-use anyhow::{ Result, anyhow };
 
 fn main() -> ExitCode {
     let args = args_parser::Args::parse();
@@ -16,7 +16,10 @@ fn main() -> ExitCode {
     };
 
     let mut parser = bencode::BencodeParser::new(bytes);
+    let info_hash = parser.info_hash().unwrap();
     let _torrent_meta = parser.parse().and_then(|value| value.torrent_meta());
+
+    println!("{:?}", hex::encode(info_hash));
 
     ExitCode::SUCCESS
 }

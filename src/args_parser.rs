@@ -4,5 +4,5 @@ use clap::Parser;
 #[command(version = "0.1", about = "")]
 pub struct Args {
     #[arg(short)]
-    pub path: String
+    pub path: String,
 }

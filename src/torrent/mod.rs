@@ -1,3 +1,3 @@
 pub mod meta;
 
-pub use meta::{ TorrentInfo, TorrentMeta };
+pub use meta::{TorrentInfo, TorrentMeta};
