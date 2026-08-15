@@ -23,14 +23,13 @@ impl TryFrom<BencodeValue> for TorrentMeta {
         if let BencodeValue::Dict(mut dict) = value {
             let announce = dict
                 .remove(&b"announce".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'announce' key in MetaInfo"))?;
+                .ok_or_else(|| anyhow!("Missing 'announce' key in MetaInfo"))?
+                .try_into()?;
 
-            let info_value = dict
+            let info = dict
                 .remove(&b"info".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'info' key in MetaInfo"))?;
-
-            let announce: String = announce.try_into()?;
-            let info: TorrentInfo = info_value.try_into()?;
+                .ok_or_else(|| anyhow!("Missing 'info' key in MetaInfo"))?
+                .try_into()?;
 
             Ok(TorrentMeta { announce, info })
         } else {
@@ -46,24 +45,23 @@ impl TryFrom<BencodeValue> for TorrentInfo {
         if let BencodeValue::Dict(mut dict) = value {
             let name = dict
                 .remove(&b"name".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'name' key in Info"))?;
+                .ok_or_else(|| anyhow!("Missing 'name' key in Info"))?
+                .try_into()?;
 
             let piece_length = dict
                 .remove(&b"piece length".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'piece length' key in Info"))?;
+                .ok_or_else(|| anyhow!("Missing 'piece length' key in Info"))?
+                .try_into()?;
 
             let pieces = dict
                 .remove(&b"pieces".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'pieces' key in Info"))?;
+                .ok_or_else(|| anyhow!("Missing 'pieces' key in Info"))?
+                .try_into()?;
 
             let length = dict
                 .remove(&b"length".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'length' key in Info"))?;
-
-            let name: String = name.try_into()?;
-            let piece_length: i64 = piece_length.try_into()?;
-            let pieces: Vec<u8> = pieces.try_into()?;
-            let length: i64 = length.try_into()?;
+                .ok_or_else(|| anyhow!("Missing 'length' key in Info"))?
+                .try_into()?;
 
             Ok(TorrentInfo {
                 name,
