@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
 use bittorrent_rs::args_parser::Args;
-use bittorrent_rs::torrent::Torrent;
 use bittorrent_rs::client::Client;
+use bittorrent_rs::torrent::Torrent;
 
 fn main() -> ExitCode {
     let args = Args::get();
