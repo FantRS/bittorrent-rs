@@ -1,8 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 
-use crate::torrent::TorrentMeta;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BencodeValue {
     Int(i64),
@@ -11,20 +9,15 @@ pub enum BencodeValue {
     Dict(BTreeMap<Vec<u8>, BencodeValue>),
 }
 
-impl BencodeValue {
-    pub fn torrent_meta(self) -> Result<TorrentMeta> {
-        TorrentMeta::try_from(self.clone())
-    }
-}
-
 impl TryFrom<BencodeValue> for i64 {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        match value {
-            BencodeValue::Int(i) => Ok(i),
-            _ => Err(anyhow!("Expected an integer, got {:?}", value)),
-        }
+        let BencodeValue::Int(i) = value else {
+            return Err(anyhow!("Expected an integer, got {:?}", value));
+        };
+
+        Ok(i)
     }
 }
 
@@ -32,10 +25,11 @@ impl TryFrom<BencodeValue> for Vec<u8> {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        match value {
-            BencodeValue::Bytes(bytes) => Ok(bytes),
-            _ => Err(anyhow!("Expected a byte string, got {:?}", value)),
-        }
+        let BencodeValue::Bytes(bytes) = value else {
+            return Err(anyhow!("Expected a byte string, got {:?}", value));
+        };
+
+        Ok(bytes)
     }
 }
 

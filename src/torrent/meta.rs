@@ -8,7 +8,7 @@ pub struct TorrentMeta {
     pub info: TorrentInfo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TorrentInfo {
     pub name: String,
     pub piece_length: i64,
@@ -72,5 +72,15 @@ impl TryFrom<BencodeValue> for TorrentInfo {
         } else {
             Err(anyhow!("Expected a dictionary for Info"))
         }
+    }
+}
+
+impl std::fmt::Debug for TorrentInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TorrentInfo")
+            .field("name", &self.name)
+            .field("piece_length", &self.piece_length)
+            .field("length", &self.length)
+            .finish()
     }
 }

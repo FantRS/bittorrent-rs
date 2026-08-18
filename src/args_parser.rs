@@ -6,3 +6,9 @@ pub struct Args {
     #[arg(short)]
     pub path: String,
 }
+
+impl Args {
+    pub fn get() -> Self {
+        Self::parse()
+    }
+}
