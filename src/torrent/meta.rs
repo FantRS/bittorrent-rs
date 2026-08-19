@@ -20,21 +20,21 @@ impl TryFrom<BencodeValue> for TorrentMeta {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        if let BencodeValue::Dict(mut dict) = value {
-            let announce = dict
-                .remove(&b"announce".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'announce' key in MetaInfo"))?
-                .try_into()?;
+        let BencodeValue::Dict(mut dict) = value else {
+            return Err(anyhow!("Expected a dictionary for MetaInfo"));
+        };
 
-            let info = dict
-                .remove(&b"info".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'info' key in MetaInfo"))?
-                .try_into()?;
+        let announce = dict
+            .remove(&b"announce".to_vec())
+            .ok_or_else(|| anyhow!("Missing 'announce' key in MetaInfo"))?
+            .try_into()?;
 
-            Ok(TorrentMeta { announce, info })
-        } else {
-            Err(anyhow!("Expected a dictionary for MetaInfo"))
-        }
+        let info = dict
+            .remove(&b"info".to_vec())
+            .ok_or_else(|| anyhow!("Missing 'info' key in MetaInfo"))?
+            .try_into()?;
+
+        Ok(TorrentMeta { announce, info })
     }
 }
 
@@ -42,36 +42,36 @@ impl TryFrom<BencodeValue> for TorrentInfo {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        if let BencodeValue::Dict(mut dict) = value {
-            let name = dict
-                .remove(&b"name".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'name' key in Info"))?
-                .try_into()?;
+        let BencodeValue::Dict(mut dict) = value else {
+            return Err(anyhow!("Expected a dictionary for Info"));
+        };
 
-            let piece_length = dict
-                .remove(&b"piece length".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'piece length' key in Info"))?
-                .try_into()?;
+        let name = dict
+            .remove(&b"name".to_vec())
+            .ok_or_else(|| anyhow!("Missing 'name' key in Info"))?
+            .try_into()?;
 
-            let pieces = dict
-                .remove(&b"pieces".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'pieces' key in Info"))?
-                .try_into()?;
+        let piece_length = dict
+            .remove(&b"piece length".to_vec())
+            .ok_or_else(|| anyhow!("Missing 'piece length' key in Info"))?
+            .try_into()?;
 
-            let length = dict
-                .remove(&b"length".to_vec())
-                .ok_or_else(|| anyhow!("Missing 'length' key in Info"))?
-                .try_into()?;
+        let pieces = dict
+            .remove(&b"pieces".to_vec())
+            .ok_or_else(|| anyhow!("Missing 'pieces' key in Info"))?
+            .try_into()?;
 
-            Ok(TorrentInfo {
-                name,
-                piece_length,
-                pieces,
-                length,
-            })
-        } else {
-            Err(anyhow!("Expected a dictionary for Info"))
-        }
+        let length = dict
+            .remove(&b"length".to_vec())
+            .ok_or_else(|| anyhow!("Missing 'length' key in Info"))?
+            .try_into()?;
+
+        Ok(TorrentInfo {
+            name,
+            piece_length,
+            pieces,
+            length,
+        })
     }
 }
 

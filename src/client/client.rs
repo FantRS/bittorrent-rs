@@ -10,20 +10,18 @@ use crate::{
 pub struct Client {
     pub id: [u8; 20],
     pub lst: TcpListener,
-
-    torrent: Torrent,
 }
 
 impl Client {
-    pub fn build(torrent: Torrent) -> Result<Self> {
+    pub fn build() -> Result<Self> {
         let id = Self::generate_id();
         let lst = Self::generate_lst()?;
 
-        Ok(Self { id, lst, torrent })
+        Ok(Self { id, lst })
     }
 
-    pub async fn send_tracker_req(&self) -> Result<TrackerResponse> {
-        let tracker_url = self.build_url()?;
+    pub async fn send_tracker_req(&self, torrent: &Torrent) -> Result<TrackerResponse> {
+        let tracker_url = self.build_url(torrent)?;
 
         let req_client = reqwest::Client::new();
         let bytes_resp = req_client.get(tracker_url).send().await?.bytes().await?;
@@ -35,12 +33,12 @@ impl Client {
         Ok(resp)
     }
 
-    fn build_url(&self) -> Result<String> {
-        let base_url = self.torrent.meta.announce.as_str();
-        let info_hash = urlencoding::encode_binary(&self.torrent.info_hash);
+    fn build_url(&self, torrent: &Torrent) -> Result<String> {
+        let base_url = torrent.meta.announce.as_str();
+        let info_hash = urlencoding::encode_binary(&torrent.info_hash);
         let peer_id = urlencoding::encode_binary(&self.id);
         let port = self.lst.local_addr()?.port();
-        let left = self.torrent.meta.info.length;
+        let left = torrent.meta.info.length;
         let uploaded = 0;
         let downloaded = 0;
         let compact = 1;
@@ -64,6 +62,7 @@ impl Client {
     fn generate_lst() -> Result<TcpListener> {
         for port in 6881..=6889 {
             let addr = format!("0.0.0.0:{}", port);
+            
             match TcpListener::bind(addr) {
                 Ok(lst) => return Ok(lst),
                 Err(_) => continue,

@@ -75,11 +75,8 @@ impl BencodeParser {
         let mut var = BTreeMap::new();
 
         self.parse_delimited(b'd', |p, _byte| {
-            let key = match p.parse_bytes()? {
-                BencodeValue::Bytes(k) => k,
-                _ => {
-                    return Err(anyhow!("Dictionary key must be a byte string"));
-                }
+            let BencodeValue::Bytes(key) = p.parse_bytes()? else {
+                return Err(anyhow!("Dictionary key must be a byte string"));
             };
 
             let inner_byte = *p

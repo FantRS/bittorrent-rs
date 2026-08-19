@@ -1,6 +1,5 @@
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
-use std::net::SocketAddrV4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BencodeValue {
@@ -44,23 +43,5 @@ impl TryFrom<BencodeValue> for String {
             }
             _ => Err(anyhow!("Expected a byte string, got {:?}", value)),
         }
-    }
-}
-
-impl TryFrom<BencodeValue> for Vec<SocketAddrV4> {
-    type Error = anyhow::Error;
-
-    fn try_from(value: BencodeValue) -> Result<Self> {
-        let BencodeValue::List(list) = value else {
-            return Err(anyhow!("Expected a list of SocketAddrV4, got {:?}", value));
-        };
-
-        list.into_iter()
-            .map(|item| {
-                let addr_str: String = item.try_into()?;
-                let socket_addr: SocketAddrV4 = addr_str.parse()?;
-                Ok(socket_addr)
-            })
-            .collect()
     }
 }
