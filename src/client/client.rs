@@ -33,22 +33,6 @@ impl Client {
         Ok(resp)
     }
 
-    fn build_url(&self, torrent: &Torrent) -> Result<String> {
-        let base_url = torrent.meta.announce.as_str();
-        let info_hash = urlencoding::encode_binary(&torrent.info_hash);
-        let peer_id = urlencoding::encode_binary(&self.id);
-        let port = self.lst.local_addr()?.port();
-        let left = torrent.meta.info.length;
-        let uploaded = 0;
-        let downloaded = 0;
-        let compact = 1;
-
-        Ok(format!(
-            "{}?info_hash={}&peer_id={}&port={}&left={}&uploaded={}&downloaded={}&compact={}",
-            base_url, info_hash, peer_id, port, left, uploaded, downloaded, compact
-        ))
-    }
-
     fn generate_id() -> [u8; 20] {
         let mut id = [0; 20];
         id[..8].copy_from_slice(b"-RS0001-");
@@ -62,7 +46,7 @@ impl Client {
     fn generate_lst() -> Result<TcpListener> {
         for port in 6881..=6889 {
             let addr = format!("0.0.0.0:{}", port);
-            
+
             match TcpListener::bind(addr) {
                 Ok(lst) => return Ok(lst),
                 Err(_) => continue,
@@ -70,5 +54,22 @@ impl Client {
         }
 
         Err(anyhow!("Could not bind to any port in range 6881-6889"))
+    }
+
+    fn build_url(&self, torrent: &Torrent) -> Result<String> {
+        let base_url = torrent.meta.announce.as_str();
+        let info_hash = urlencoding::encode_binary(&torrent.info_hash);
+        let peer_id = urlencoding::encode_binary(&self.id);
+        let port = self.lst.local_addr()?.port();
+        let left = torrent.meta.info.length;
+        let uploaded = 0;
+        let downloaded = 0;
+        let compact = 1;
+        let numwant = 100;
+
+        Ok(format!(
+            "{}?info_hash={}&peer_id={}&port={}&left={}&uploaded={}&downloaded={}&compact={}&numwant={}",
+            base_url, info_hash, peer_id, port, left, uploaded, downloaded, compact, numwant
+        ))
     }
 }
