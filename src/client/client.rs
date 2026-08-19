@@ -1,31 +1,53 @@
 use anyhow::{Result, anyhow};
 use std::net::TcpListener;
 
-use crate::torrent::Torrent;
+use crate::{
+    bencode::BencodeParser,
+    torrent::{Torrent, TrackerResponse},
+};
 
 #[derive(Debug)]
 pub struct Client {
     pub id: [u8; 20],
     pub lst: TcpListener,
+
+    torrent: Torrent,
 }
 
 impl Client {
-    pub fn build() -> Result<Self> {
+    pub fn build(torrent: Torrent) -> Result<Self> {
         let id = Self::generate_id();
         let lst = Self::generate_lst()?;
 
-        Ok(Self { id, lst })
+        Ok(Self { id, lst, torrent })
     }
 
-    pub fn format_url(&self, torrent: &Torrent) -> Result<String> {
-        let base_url = torrent.meta.announce.as_str();
-        let info_hash = urlencoding::encode_binary(&torrent.info_hash);
+    pub async fn send_tracker_req(&self) -> Result<TrackerResponse> {
+        let tracker_url = self.build_url()?;
+
+        let req_client = reqwest::Client::new();
+        let bytes_resp = req_client.get(tracker_url).send().await?.bytes().await?;
+
+        let mut parser = BencodeParser::new(bytes_resp.to_vec());
+        let bencode_resp = parser.parse()?;
+        let resp = bencode_resp.try_into()?;
+
+        Ok(resp)
+    }
+
+    fn build_url(&self) -> Result<String> {
+        let base_url = self.torrent.meta.announce.as_str();
+        let info_hash = urlencoding::encode_binary(&self.torrent.info_hash);
         let peer_id = urlencoding::encode_binary(&self.id);
         let port = self.lst.local_addr()?.port();
+        let left = self.torrent.meta.info.length;
+        let uploaded = 0;
+        let downloaded = 0;
+        let compact = 1;
 
         Ok(format!(
-            "{}?info_hash={}&peer_id={}&port={}",
-            base_url, info_hash, peer_id, port
+            "{}?info_hash={}&peer_id={}&port={}&left={}&uploaded={}&downloaded={}&compact={}",
+            base_url, info_hash, peer_id, port, left, uploaded, downloaded, compact
         ))
     }
 

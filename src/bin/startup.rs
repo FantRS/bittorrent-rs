@@ -8,10 +8,9 @@ pub fn start() -> Result<()> {
     let args = Args::get();
 
     let torrent = Torrent::load(args.path)?;
-    let client = Client::build()?;
+    let client = Client::build(torrent)?;
 
     println!("Client ID: {:?}", client.id);
-    println!("{:#?}", torrent);
 
     Ok(())
 }

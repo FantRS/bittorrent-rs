@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 
 use crate::bencode::BencodeValue;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TorrentMeta {
     pub announce: String,
     pub info: TorrentInfo,
@@ -11,9 +11,9 @@ pub struct TorrentMeta {
 #[derive(Clone)]
 pub struct TorrentInfo {
     pub name: String,
-    pub piece_length: i64,
+    pub piece_length: u64,
     pub pieces: Vec<u8>,
-    pub length: i64,
+    pub length: u64,
 }
 
 impl TryFrom<BencodeValue> for TorrentMeta {
