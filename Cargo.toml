@@ -2,6 +2,7 @@
 name = "bittorrent-rs"
 version = "0.1.0"
 edition = "2024"
+autobins = false
 
 [dependencies]
 anyhow = "1.0.104"
@@ -9,3 +10,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 rand = "0.10.2"
 sha1 = "0.11.0"
 urlencoding = "2.1.3"
+
+[[bin]]
+name = "bittorrent"
+path = "src/bin/main.rs"
