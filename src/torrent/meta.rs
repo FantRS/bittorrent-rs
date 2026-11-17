@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
-use crate::bencode::BencodeValue;
+use crate::bencode::{BencodeValue, Dict, DictExt};
 
 #[derive(Debug)]
 pub struct TorrentMeta {
@@ -20,21 +20,12 @@ impl TryFrom<BencodeValue> for TorrentMeta {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        let BencodeValue::Dict(mut dict) = value else {
-            return Err(anyhow!("Expected a dictionary for MetaInfo"));
-        };
+        let mut dict = Dict::try_from(value)?;
 
-        let announce = dict
-            .remove(&b"announce".to_vec())
-            .ok_or_else(|| anyhow!("Missing 'announce' key in MetaInfo"))?
-            .try_into()?;
-
-        let info = dict
-            .remove(&b"info".to_vec())
-            .ok_or_else(|| anyhow!("Missing 'info' key in MetaInfo"))?
-            .try_into()?;
-
-        Ok(TorrentMeta { announce, info })
+        Ok(Self {
+            announce: dict.take("announce")?,
+            info: dict.take("info")?,
+        })
     }
 }
 
@@ -42,35 +33,13 @@ impl TryFrom<BencodeValue> for TorrentInfo {
     type Error = anyhow::Error;
 
     fn try_from(value: BencodeValue) -> Result<Self> {
-        let BencodeValue::Dict(mut dict) = value else {
-            return Err(anyhow!("Expected a dictionary for Info"));
-        };
+        let mut dict = Dict::try_from(value)?;
 
-        let name = dict
-            .remove(&b"name".to_vec())
-            .ok_or_else(|| anyhow!("Missing 'name' key in Info"))?
-            .try_into()?;
-
-        let piece_length = dict
-            .remove(&b"piece length".to_vec())
-            .ok_or_else(|| anyhow!("Missing 'piece length' key in Info"))?
-            .try_into()?;
-
-        let pieces = dict
-            .remove(&b"pieces".to_vec())
-            .ok_or_else(|| anyhow!("Missing 'pieces' key in Info"))?
-            .try_into()?;
-
-        let length = dict
-            .remove(&b"length".to_vec())
-            .ok_or_else(|| anyhow!("Missing 'length' key in Info"))?
-            .try_into()?;
-
-        Ok(TorrentInfo {
-            name,
-            piece_length,
-            pieces,
-            length,
+        Ok(Self {
+            name: dict.take("name")?,
+            piece_length: dict.take("piece length")?,
+            pieces: dict.take("pieces")?,
+            length: dict.take("length")?,
         })
     }
 }
@@ -81,6 +50,6 @@ impl std::fmt::Debug for TorrentInfo {
             .field("name", &self.name)
             .field("piece_length", &self.piece_length)
             .field("length", &self.length)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

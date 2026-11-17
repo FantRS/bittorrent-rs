@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 
 use crate::{
     bencode::BencodeParser,
@@ -23,37 +23,21 @@ impl Client {
     pub async fn send_tracker_req(&self, torrent: &Torrent) -> Result<TrackerResponse> {
         let tracker_url = self.build_url(torrent)?;
 
-        let req_client = reqwest::Client::new();
-        let bytes_resp = req_client.get(tracker_url).send().await?.bytes().await?;
+        let body = reqwest::get(tracker_url).await?.bytes().await?;
 
-        let mut parser = BencodeParser::new(bytes_resp.to_vec());
-        let bencode_resp = parser.parse()?;
-        let resp = bencode_resp.try_into()?;
-
-        Ok(resp)
+        BencodeParser::new(body.to_vec()).parse()?.try_into()
     }
 
     fn generate_id() -> [u8; 20] {
-        let mut id = [0; 20];
+        let mut id: [u8; 20] = rand::random();
         id[..8].copy_from_slice(b"-RS0001-");
-
-        let rands: [u8; 12] = rand::random();
-        id[8..].copy_from_slice(&rands);
-
         id
     }
 
     fn generate_lst() -> Result<TcpListener> {
-        for port in 6881..=6889 {
-            let addr = format!("0.0.0.0:{}", port);
-
-            match TcpListener::bind(addr) {
-                Ok(lst) => return Ok(lst),
-                Err(_) => continue,
-            }
-        }
-
-        Err(anyhow!("Could not bind to any port in range 6881-6889"))
+        (6881..=6889)
+            .find_map(|port| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).ok())
+            .ok_or_else(|| anyhow!("Could not bind to any port in range 6881-6889"))
     }
 
     fn build_url(&self, torrent: &Torrent) -> Result<String> {
@@ -68,8 +52,7 @@ impl Client {
         let numwant = 100;
 
         Ok(format!(
-            "{}?info_hash={}&peer_id={}&port={}&left={}&uploaded={}&downloaded={}&compact={}&numwant={}",
-            base_url, info_hash, peer_id, port, left, uploaded, downloaded, compact, numwant
+            "{base_url}?info_hash={info_hash}&peer_id={peer_id}&port={port}&left={left}&uploaded={uploaded}&downloaded={downloaded}&compact={compact}&numwant={numwant}"
         ))
     }
 }

@@ -8,15 +8,18 @@ use crate::bencode::BencodeValue;
 pub struct BencodeParser {
     bytes: Vec<u8>,
     cursor: usize,
+    depth: usize,
 
     info_span: Option<(usize, usize)>,
 }
 
 impl BencodeParser {
+    #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
         BencodeParser {
             bytes,
             cursor: 0,
+            depth: 0,
             info_span: None,
         }
     }
@@ -25,6 +28,7 @@ impl BencodeParser {
         self.parse_dict()
     }
 
+    #[must_use]
     pub fn info_hash(&self) -> Option<[u8; 20]> {
         let (start, end) = self.info_span?;
 
@@ -48,8 +52,9 @@ impl BencodeParser {
         let raw = self.read_until(b':')?;
         let len: usize = String::from_utf8(raw)?.parse()?;
         let var = self
-            .bytes
-            .get(self.cursor..self.cursor + len)
+            .cursor
+            .checked_add(len)
+            .and_then(|end| self.bytes.get(self.cursor..end))
             .ok_or_else(|| anyhow!("Invalid byte string"))?
             .to_vec();
         self.cursor += len;
@@ -84,7 +89,7 @@ impl BencodeParser {
                 .get(p.cursor)
                 .ok_or_else(|| anyhow!("Unexpected end of input while reading dictionary value"))?;
 
-            let is_info_key = key == b"info";
+            let is_info_key = p.depth == 1 && key == b"info";
             let value_start = p.cursor;
 
             let value = p.parse_by_type(inner_byte)?;
@@ -140,10 +145,12 @@ impl BencodeParser {
             match byte {
                 b if b == open && is_start => {
                     self.cursor += 1;
+                    self.depth += 1;
                     is_start = false;
                 }
                 b'e' => {
                     self.cursor += 1;
+                    self.depth -= 1;
                     is_end = true;
                     break;
                 }
@@ -319,5 +326,20 @@ mod tests {
         // помилка: словник без завершального 'e'
         let mut p = BencodeParser::new(b"d3:foo3:bar".to_vec());
         assert!(p.parse_dict().is_err());
+
+        let mut p = BencodeParser::new(b"d18446744073709551615:xe".to_vec());
+        assert!(p.parse_dict().is_err());
+    }
+
+    #[test]
+    fn info_hash_cases() {
+        let mut p = BencodeParser::new(b"d4:infod4:infoi1e1:ai2ee7:x-extrad4:infoi3eee".to_vec());
+        p.parse().unwrap();
+        let expected: [u8; 20] = Sha1::digest(b"d4:infoi1e1:ai2ee").into();
+        assert_eq!(p.info_hash(), Some(expected));
+
+        let mut p = BencodeParser::new(b"d3:fooi1ee".to_vec());
+        p.parse().unwrap();
+        assert_eq!(p.info_hash(), None);
     }
 }

@@ -1,5 +1,5 @@
-pub mod bencode;
 pub mod parser;
+pub mod value;
 
-pub use bencode::BencodeValue;
 pub use parser::BencodeParser;
+pub use value::{BencodeValue, Dict, DictExt};

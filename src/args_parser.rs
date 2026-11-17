@@ -1,13 +1,15 @@
 use clap::Parser;
 
 #[derive(Debug, Parser)]
-#[command(version = "0.1", about = "")]
+#[command(version)]
 pub struct Args {
-    #[arg(short)]
+    /// Full path to .torrent file in your PC
+    #[arg(short, long)]
     pub path: String,
 }
 
 impl Args {
+    #[must_use]
     pub fn get() -> Self {
         Self::parse()
     }
