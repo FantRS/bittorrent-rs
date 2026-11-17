@@ -1,6 +1,8 @@
 pub mod connection;
 pub mod handshake;
 pub mod message;
+#[cfg(test)]
+pub(crate) mod testing;
 
 pub use connection::PeerConnection;
 pub use handshake::Handshake;
