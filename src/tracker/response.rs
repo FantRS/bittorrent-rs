@@ -42,7 +42,7 @@ impl TryFrom<BencodeValue> for TrackerResponse {
     }
 }
 
-fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
+pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
     let (chunks, rest) = bytes.as_chunks::<6>();
     ensure!(
         rest.is_empty(),

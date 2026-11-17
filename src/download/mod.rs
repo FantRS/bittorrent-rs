@@ -2,13 +2,14 @@ mod picker;
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{self, JoinSet};
 use tokio::time::{Instant, timeout_at};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::peer::PeerConnection;
 use crate::session::Session;
@@ -19,28 +20,21 @@ const PIECE_BUFFER: usize = 16;
 
 pub async fn download(
     session: Arc<Session>,
-    peers: impl IntoIterator<Item = SocketAddr>,
+    mut peers: mpsc::Receiver<SocketAddr>,
     mut on_piece: impl FnMut(u64),
 ) -> Result<()> {
-    let piece_count = session.torrent.meta.info.piece_count();
-    let picker = Arc::new(Picker::new(piece_count));
-    let (sender, mut pieces) = mpsc::channel(PIECE_BUFFER);
+    let missing = session.missing();
+    let mut remaining = missing.count_ones();
+    let picker = Arc::new(Picker::new(missing));
+    let (sender, mut pieces) = mpsc::channel::<(u32, Bytes)>(PIECE_BUFFER);
+    let mut active: HashMap<task::Id, SocketAddr> = HashMap::new();
+    let mut tasks = JoinSet::new();
 
-    let mut tasks: JoinSet<_> = peers
-        .into_iter()
-        .map(|addr| {
-            run_peer(
-                addr,
-                Arc::clone(&session),
-                Arc::clone(&picker),
-                sender.clone(),
-            )
-        })
-        .collect();
-    drop(sender);
-
-    let mut remaining = piece_count;
     while remaining > 0 {
+        if tasks.is_empty() && pieces.is_empty() && peers.is_closed() && peers.is_empty() {
+            bail!("No peers left with {remaining} pieces missing");
+        }
+
         tokio::select! {
             Some((index, piece)) = pieces.recv() => {
                 let len = u64::try_from(piece.len())?;
@@ -48,12 +42,25 @@ pub async fn download(
                 remaining -= 1;
                 on_piece(len);
             }
-            Some(joined) = tasks.join_next() => {
-                if let Err(e) = joined.map_err(anyhow::Error::from).and_then(|result| result) {
-                    debug!("{e:#}");
+            Some(addr) = peers.recv() => {
+                if !active.values().any(|&known| known == addr) {
+                    let peer = run_peer(addr, Arc::clone(&session), Arc::clone(&picker), sender.clone());
+                    active.insert(tasks.spawn(peer).id(), addr);
                 }
             }
-            else => bail!("All peers disconnected with {remaining} pieces left"),
+            Some(joined) = tasks.join_next_with_id() => {
+                let (id, result) = match joined {
+                    Ok((id, result)) => (id, result),
+                    Err(e) => (e.id(), Err(e.into())),
+                };
+                active.remove(&id);
+                if let Err(e) = result {
+                    debug!("{e:#}");
+                }
+                if active.is_empty() {
+                    warn!("All peers disconnected, waiting for trackers");
+                }
+            }
         }
     }
 
@@ -140,6 +147,14 @@ mod tests {
 
     const INFO_HASH: [u8; 20] = [7; 20];
 
+    fn queue(addrs: impl IntoIterator<Item = SocketAddr>) -> mpsc::Receiver<SocketAddr> {
+        let (sender, receiver) = mpsc::channel(16);
+        for addr in addrs {
+            sender.try_send(addr).unwrap();
+        }
+        receiver
+    }
+
     fn data() -> Bytes {
         (0..=u8::MAX).cycle().take(100_000).collect()
     }
@@ -157,7 +172,7 @@ mod tests {
         let storage = Storage::create(dir, &info).await.unwrap();
         let torrent = Torrent {
             meta: TorrentMeta {
-                announce: String::new(),
+                trackers: Vec::new(),
                 info,
             },
             info_hash: INFO_HASH,
@@ -179,12 +194,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let leecher = session(dir.path(), [2; 20]).await;
         let mut received = 0;
-        download(Arc::clone(&leecher), peers, |len| received += len)
+        download(Arc::clone(&leecher), queue(peers), |len| received += len)
             .await
             .unwrap();
 
         assert_eq!(received, 100_000);
-        assert_eq!(leecher.stats(None).left, 0);
+        assert_eq!(leecher.announce(0, None).left, 0);
         assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), data());
     }
 
@@ -207,13 +222,23 @@ mod tests {
 
         tokio::select! {
             result = seed(Arc::clone(&seeder), &listener) => result.unwrap(),
-            result = download(Arc::clone(&leecher), [addr], |_| {}) => result.unwrap(),
+            result = download(Arc::clone(&leecher), queue([addr]), |_| {}) => result.unwrap(),
         }
 
         assert_eq!(
             std::fs::read(leecher_dir.path().join("file")).unwrap(),
             data()
         );
-        assert_eq!(seeder.stats(None).uploaded, 100_000);
+        assert_eq!(seeder.announce(0, None).uploaded, 100_000);
+
+        let resumed = session(leecher_dir.path(), [3; 20]).await;
+        assert_eq!(resumed.resume().await.unwrap(), 3);
+        assert!(resumed.is_complete());
+        assert_eq!(resumed.announce(0, None).left, 0);
+        download(resumed, queue([]), |_| {}).await.unwrap();
+
+        let empty = session(tempfile::tempdir().unwrap().path(), [4; 20]).await;
+        assert_eq!(empty.resume().await.unwrap(), 0);
+        assert!(download(empty, queue([]), |_| {}).await.is_err());
     }
 }

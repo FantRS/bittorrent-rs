@@ -5,7 +5,7 @@ use crate::bencode::{BencodeValue, Dict, DictExt};
 
 #[derive(Debug)]
 pub struct TorrentMeta {
-    pub announce: String,
+    pub trackers: Vec<String>,
     pub info: TorrentInfo,
 }
 
@@ -23,8 +23,21 @@ impl TryFrom<BencodeValue> for TorrentMeta {
     fn try_from(value: BencodeValue) -> Result<Self> {
         let mut dict = Dict::try_from(value)?;
 
+        let mut trackers: Vec<String> = dict
+            .take_opt::<Vec<BencodeValue>>("announce-list")
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tier| Vec::<BencodeValue>::try_from(tier).ok())
+            .flatten()
+            .filter_map(|tracker| String::try_from(tracker).ok())
+            .collect();
+        if trackers.is_empty() {
+            trackers.extend(dict.take_opt::<String>("announce"));
+        }
+        ensure!(!trackers.is_empty(), "Torrent has no trackers");
+
         Ok(Self {
-            announce: dict.take("announce")?,
+            trackers,
             info: dict.take("info")?,
         })
     }
@@ -88,6 +101,28 @@ impl std::fmt::Debug for TorrentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bencode::BencodeParser;
+
+    fn trackers(bencode: &str) -> Result<Vec<String>> {
+        let info = "d6:lengthi1e4:name1:f12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let value = BencodeParser::new(format!("d{bencode}4:info{info}e").into_bytes()).parse()?;
+        Ok(TorrentMeta::try_from(value)?.trackers)
+    }
+
+    #[test]
+    fn tracker_cases() {
+        assert_eq!(trackers("8:announce5:http1").unwrap(), ["http1"]);
+        assert_eq!(
+            trackers("8:announce5:http113:announce-listll5:http1el4:udp14:udp2ee").unwrap(),
+            ["http1", "udp1", "udp2"]
+        );
+        assert_eq!(trackers("13:announce-listll4:udp1ee").unwrap(), ["udp1"]);
+        assert_eq!(
+            trackers("8:announce5:http113:announce-listle").unwrap(),
+            ["http1"]
+        );
+        assert!(trackers("").is_err());
+    }
 
     #[test]
     fn piece_cases() {

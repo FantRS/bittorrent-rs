@@ -1,8 +1,6 @@
 pub mod meta;
-pub mod tracker_response;
 
 pub use meta::{TorrentInfo, TorrentMeta};
-pub use tracker_response::TrackerResponse;
 
 use anyhow::{Result, anyhow};
 use std::path::Path;

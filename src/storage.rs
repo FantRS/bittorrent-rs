@@ -12,6 +12,7 @@ use crate::torrent::TorrentInfo;
 pub struct Storage {
     file: Arc<RandomAccessFile>,
     piece_length: u64,
+    existing: bool,
 }
 
 impl Storage {
@@ -28,12 +29,19 @@ impl Storage {
             .truncate(false)
             .open(dir.as_ref().join(name))
             .await?;
+        let existing = file.metadata().await?.len() > 0;
         file.set_len(info.length).await?;
 
         Ok(Self {
             file: Arc::new(RandomAccessFile::try_new(file.into_std().await)?),
             piece_length: info.piece_length,
+            existing,
         })
+    }
+
+    #[must_use]
+    pub fn has_existing_data(&self) -> bool {
+        self.existing
     }
 
     pub async fn write_piece(&self, index: u32, data: Bytes) -> Result<()> {
@@ -47,13 +55,15 @@ impl Storage {
 
     pub async fn read_block(&self, index: u32, begin: u32, length: u32) -> Result<Bytes> {
         let offset = self.offset(index, begin)?;
-        let mut buf = vec![0; usize::try_from(length)?];
         let file = Arc::clone(&self.file);
 
-        let buf =
-            spawn_blocking(move || file.read_exact_at(offset, &mut buf).map(|()| buf)).await??;
+        let buf = spawn_blocking(move || read_at(&file, offset, length)).await??;
 
         Ok(Bytes::from(buf))
+    }
+
+    pub fn read_piece_blocking(&self, index: u32, length: u32) -> Result<Vec<u8>> {
+        read_at(&self.file, self.offset(index, 0)?, length)
     }
 
     fn offset(&self, index: u32, begin: u32) -> Result<u64> {
@@ -62,6 +72,13 @@ impl Storage {
             .and_then(|start| start.checked_add(u64::from(begin)))
             .context("Block offset overflow")
     }
+}
+
+fn read_at(file: &RandomAccessFile, offset: u64, length: u32) -> Result<Vec<u8>> {
+    let mut buf = vec![0; usize::try_from(length)?];
+    file.read_exact_at(offset, &mut buf)?;
+
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -82,6 +99,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let storage = Storage::create(dir.path(), &info("file")).await.unwrap();
+        assert!(!storage.has_existing_data());
         storage
             .write_piece(1, Bytes::from_static(b"ef"))
             .await
@@ -96,6 +114,8 @@ mod tests {
         assert!(storage.read_block(1, 0, 4).await.is_err());
 
         let reopened = Storage::create(dir.path(), &info("file")).await.unwrap();
+        assert!(reopened.has_existing_data());
+        assert_eq!(reopened.read_piece_blocking(1, 2).unwrap(), b"ef");
         assert_eq!(&reopened.read_block(0, 0, 4).await.unwrap()[..], b"abcd");
 
         Storage::create(dir.path(), &info("../escape"))

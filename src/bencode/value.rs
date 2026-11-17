@@ -75,6 +75,18 @@ impl TryFrom<BencodeValue> for Vec<u8> {
     }
 }
 
+impl TryFrom<BencodeValue> for Vec<BencodeValue> {
+    type Error = anyhow::Error;
+
+    fn try_from(value: BencodeValue) -> Result<Self> {
+        let BencodeValue::List(list) = value else {
+            return Err(anyhow!("Expected a list, got {value:?}"));
+        };
+
+        Ok(list)
+    }
+}
+
 impl TryFrom<BencodeValue> for String {
     type Error = anyhow::Error;
 

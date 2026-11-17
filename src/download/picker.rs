@@ -24,11 +24,11 @@ pub struct Reservation {
 
 impl Picker {
     #[must_use]
-    pub fn new(piece_count: usize) -> Self {
+    pub fn new(missing: BitVec) -> Self {
         Self {
             state: Mutex::new(State {
-                available: BitVec::repeat(true, piece_count),
-                missing: BitVec::repeat(true, piece_count),
+                available: missing.clone(),
+                missing,
             }),
             released: watch::Sender::new(()),
         }
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn reservation_cases() {
-        let picker = Arc::new(Picker::new(3));
+        let picker = Arc::new(Picker::new(BitVec::repeat(true, 3)));
         let released = picker.subscribe();
 
         let first = picker.reserve(|_| true).unwrap();

@@ -1,14 +1,18 @@
 use anyhow::{Context, Result, ensure};
 use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
+use futures_util::future::join_all;
 use parking_lot::RwLock;
+use rayon::prelude::*;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::client::{Announce, Event};
 use crate::peer::Request;
 use crate::storage::Storage;
 use crate::torrent::Torrent;
+use crate::tracker::{Announce, Event, announce_periodically};
 
 const MAX_BLOCK_LEN: u32 = 1 << 17;
 const HAVE_BUFFER: usize = 64;
@@ -40,6 +44,55 @@ impl Session {
         }
     }
 
+    pub async fn resume(self: &Arc<Self>) -> Result<usize> {
+        if !self.storage.has_existing_data() {
+            return Ok(0);
+        }
+
+        let session = Arc::clone(self);
+        let (sender, receiver) = oneshot::channel();
+        rayon::spawn(move || {
+            let _ = sender.send(session.verify_existing());
+        });
+
+        Ok(receiver.await?)
+    }
+
+    fn verify_existing(&self) -> usize {
+        let info = &self.torrent.meta.info;
+        let valid: Vec<usize> = (0..info.piece_count())
+            .into_par_iter()
+            .filter_map(|slot| {
+                let index = u32::try_from(slot).ok()?;
+                let length = info.piece_len(index)?;
+                let piece = self.storage.read_piece_blocking(index, length).ok()?;
+                info.verify(index, &piece).then_some(slot)
+            })
+            .collect();
+
+        let mut have = self.have.write();
+        for &slot in &valid {
+            have.set(slot, true);
+        }
+
+        valid.len()
+    }
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.have.read().all()
+    }
+
+    #[must_use]
+    pub fn missing(&self) -> BitVec {
+        self.have.read().iter().map(|bit| !*bit).collect()
+    }
+
+    #[must_use]
+    pub fn verified_bytes(&self) -> u64 {
+        self.torrent.meta.info.length.saturating_sub(self.left())
+    }
+
     #[must_use]
     pub fn bitfield(&self) -> Bytes {
         Bytes::copy_from_slice(self.have.read().as_raw_slice())
@@ -51,15 +104,37 @@ impl Session {
     }
 
     #[must_use]
-    pub fn stats(&self, event: Option<Event>) -> Announce {
-        let downloaded = self.downloaded.load(Ordering::Relaxed);
-
+    pub fn announce(&self, port: u16, event: Option<Event>) -> Announce {
         Announce {
+            info_hash: self.torrent.info_hash,
+            peer_id: self.peer_id,
+            port,
             uploaded: self.uploaded.load(Ordering::Relaxed),
-            downloaded,
-            left: self.torrent.meta.info.length.saturating_sub(downloaded),
+            downloaded: self.downloaded.load(Ordering::Relaxed),
+            left: self.left(),
             event,
         }
+    }
+
+    pub async fn run_announcer(&self, port: u16, peers: mpsc::Sender<SocketAddr>) {
+        let request = |event| self.announce(port, event);
+        let trackers = self.torrent.meta.trackers.iter();
+
+        join_all(trackers.map(|tracker| announce_periodically(tracker, request, &peers))).await;
+    }
+
+    fn left(&self) -> u64 {
+        let info = &self.torrent.meta.info;
+        self.have
+            .read()
+            .iter_zeros()
+            .filter_map(|slot| {
+                u32::try_from(slot)
+                    .ok()
+                    .and_then(|index| info.piece_len(index))
+            })
+            .map(u64::from)
+            .sum()
     }
 
     pub async fn store_piece(&self, index: u32, piece: Bytes) -> Result<()> {
