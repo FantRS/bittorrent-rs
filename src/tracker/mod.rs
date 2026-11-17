@@ -6,12 +6,12 @@ pub use response::TrackerResponse;
 
 use anyhow::{Context, Result, bail};
 use futures_util::future::join_all;
-use reqwest::Url;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -75,7 +75,7 @@ pub async fn announce_periodically(
                     interval.as_secs()
                 );
                 for peer in response.peers {
-                    let _ = peers.try_send(SocketAddr::V4(peer));
+                    let _ = peers.try_send(peer);
                 }
                 event = None;
                 interval

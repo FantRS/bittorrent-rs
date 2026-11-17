@@ -1,6 +1,6 @@
 use anyhow::Result;
-use reqwest::Url;
 use std::fmt::Write;
+use url::Url;
 
 use crate::bencode::BencodeParser;
 use crate::tracker::{Announce, TrackerResponse};

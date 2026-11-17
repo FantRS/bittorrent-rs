@@ -1,6 +1,6 @@
 pub mod meta;
 
-pub use meta::{TorrentInfo, TorrentMeta};
+pub use meta::{FileEntry, TorrentInfo, TorrentMeta};
 
 use anyhow::{Result, anyhow};
 use std::path::Path;

@@ -1,12 +1,15 @@
-use anyhow::{Context, Result, bail, ensure};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use anyhow::{Context, Result, anyhow, bail};
+use std::net::{IpAddr, SocketAddr};
+use tracing::warn;
+use zerocopy::network_endian::U16;
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 use crate::bencode::{BencodeValue, Dict, DictExt};
 
 #[derive(Debug)]
 pub struct TrackerResponse {
     pub interval: u64,
-    pub peers: Vec<SocketAddrV4>,
+    pub peers: Vec<SocketAddr>,
 
     pub tracker_id: Option<Vec<u8>>,
     pub complete: Option<u64>,
@@ -23,14 +26,20 @@ impl TryFrom<BencodeValue> for TrackerResponse {
             bail!(reason);
         }
 
-        let peers = match dict
+        let mut peers = match dict
             .remove(b"peers".as_slice())
             .context("Missing 'peers' key")?
         {
-            BencodeValue::Bytes(bytes) => parse_compact_peers(&bytes)?,
+            BencodeValue::Bytes(bytes) => parse_compact_peers::<[u8; 4]>(&bytes)?,
             BencodeValue::List(peers) => peers.into_iter().filter_map(parse_peer).collect(),
             other => bail!("Invalid 'peers' value: {other:?}"),
         };
+        if let Some(bytes) = dict.take_opt::<Vec<u8>>("peers6") {
+            match parse_compact_peers::<[u8; 16]>(&bytes) {
+                Ok(peers6) => peers.extend(peers6),
+                Err(e) => warn!("Ignoring 'peers6': {e:#}"),
+            }
+        }
 
         Ok(Self {
             interval: dict.take("interval")?,
@@ -42,30 +51,33 @@ impl TryFrom<BencodeValue> for TrackerResponse {
     }
 }
 
-pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
-    let (chunks, rest) = bytes.as_chunks::<6>();
-    ensure!(
-        rest.is_empty(),
-        "Compact peers length is not a multiple of 6"
-    );
+#[derive(FromBytes, KnownLayout, Immutable)]
+#[repr(C)]
+struct CompactPeer<Ip> {
+    ip: Ip,
+    port: U16,
+}
 
-    Ok(chunks
+pub(crate) fn parse_compact_peers<Ip>(bytes: &[u8]) -> Result<Vec<SocketAddr>>
+where
+    Ip: FromBytes + KnownLayout + Immutable + Copy,
+    IpAddr: From<Ip>,
+{
+    let peers = <[CompactPeer<Ip>]>::ref_from_bytes(bytes)
+        .map_err(|_| anyhow!("Invalid compact peers length: {}", bytes.len()))?;
+
+    Ok(peers
         .iter()
-        .map(|&[a, b, c, d, hi, lo]| {
-            SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), u16::from_be_bytes([hi, lo]))
-        })
+        .map(|peer| SocketAddr::new(peer.ip.into(), peer.port.get()))
         .collect())
 }
 
-fn parse_peer(value: BencodeValue) -> Option<SocketAddrV4> {
+fn parse_peer(value: BencodeValue) -> Option<SocketAddr> {
     let mut dict = Dict::try_from(value).ok()?;
     let ip: String = dict.take_opt("ip")?;
     let port: u64 = dict.take_opt("port")?;
 
-    Some(SocketAddrV4::new(
-        ip.parse().ok()?,
-        u16::try_from(port).ok()?,
-    ))
+    Some(SocketAddr::new(ip.parse().ok()?, u16::try_from(port).ok()?))
 }
 
 #[cfg(test)]
@@ -93,7 +105,28 @@ mod tests {
         let list =
             parse(b"d8:intervali60e5:peersld2:ip9:127.0.0.14:porti6881eed2:ip3:::14:porti1eeee")
                 .unwrap();
-        assert_eq!(list.peers, ["127.0.0.1:6881".parse().unwrap()]);
+        assert_eq!(
+            list.peers,
+            [
+                "127.0.0.1:6881".parse().unwrap(),
+                "[::1]:1".parse().unwrap()
+            ]
+        );
+
+        let dual = parse(
+            b"d8:intervali60e5:peers6:\x7f\0\0\x01\x1a\xe16:peers618:\x20\x01\x0d\xb8\0\0\0\0\0\0\0\0\0\0\0\x01\x1a\xe1e",
+        )
+        .unwrap();
+        assert_eq!(
+            dual.peers,
+            [
+                "127.0.0.1:6881".parse().unwrap(),
+                "[2001:db8::1]:6881".parse().unwrap()
+            ]
+        );
+        let broken6 =
+            parse(b"d8:intervali60e5:peers6:\x7f\0\0\x01\x1a\xe16:peers65:\0\0\0\0\0e").unwrap();
+        assert_eq!(broken6.peers, ["127.0.0.1:6881".parse().unwrap()]);
 
         let empty = parse(b"d8:intervali60e5:peerslee").unwrap();
         assert!(empty.peers.is_empty());

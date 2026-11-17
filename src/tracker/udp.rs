@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::Url;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::{Instant, timeout_at};
+use url::{Host, Url};
 use zerocopy::network_endian::{I32, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -60,12 +60,15 @@ struct AnnounceResponse {
 }
 
 pub async fn announce(url: &Url, request: &Announce) -> Result<TrackerResponse> {
-    let host = url.host_str().context("Tracker URL has no host")?;
     let port = url.port().context("Tracker URL has no port")?;
-    let addr = lookup_host((host, port))
-        .await?
-        .next()
-        .with_context(|| format!("Could not resolve {host}"))?;
+    let addr = match url.host().context("Tracker URL has no host")? {
+        Host::Domain(host) => lookup_host((host, port))
+            .await?
+            .next()
+            .with_context(|| format!("Could not resolve {host}"))?,
+        Host::Ipv4(ip) => (ip, port).into(),
+        Host::Ipv6(ip) => (ip, port).into(),
+    };
 
     let local: SocketAddr = match addr {
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -95,10 +98,14 @@ pub async fn announce(url: &Url, request: &Announce) -> Result<TrackerResponse> 
     let reply = exchange(&socket, packet.as_bytes(), transaction_id, ACTION_ANNOUNCE).await?;
     let (body, peers) = AnnounceResponse::ref_from_prefix(&reply)
         .map_err(|_| anyhow!("Announce response is too short"))?;
+    let peers = match addr {
+        SocketAddr::V4(_) => parse_compact_peers::<[u8; 4]>(peers)?,
+        SocketAddr::V6(_) => parse_compact_peers::<[u8; 16]>(peers)?,
+    };
 
     Ok(TrackerResponse {
         interval: body.interval.get().into(),
-        peers: parse_compact_peers(peers)?,
+        peers,
         tracker_id: None,
         complete: Some(body.seeders.get().into()),
         incomplete: Some(body.leechers.get().into()),
@@ -164,10 +171,15 @@ fn event_code(event: Option<Event>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
-    async fn spawn_tracker(error: Option<&'static str>) -> Url {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    async fn spawn_tracker(ip: IpAddr, error: Option<&'static str>) -> Url {
+        let socket = UdpSocket::bind((ip, 0)).await.unwrap();
         let url = Url::parse(&format!("udp://{}", socket.local_addr().unwrap())).unwrap();
+        let peer = match ip {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
 
         tokio::spawn(async move {
             let mut buf = [0; MAX_PACKET_LEN];
@@ -192,7 +204,8 @@ mod tests {
                         &1800u32.to_be_bytes(),
                         &5u32.to_be_bytes(),
                         &9u32.to_be_bytes(),
-                        &[127, 0, 0, 1, 0x1a, 0xe1],
+                        &peer,
+                        &6881u16.to_be_bytes(),
                     ]
                     .concat(),
                 };
@@ -216,17 +229,18 @@ mod tests {
         };
         assert_eq!(size_of::<AnnounceRequest>(), 98);
 
-        let response = announce(&spawn_tracker(None).await, &request)
-            .await
-            .unwrap();
-        assert_eq!(response.interval, 1800);
-        assert_eq!(response.complete, Some(9));
-        assert_eq!(response.incomplete, Some(5));
-        assert_eq!(response.peers, ["127.0.0.1:6881".parse().unwrap()]);
+        for ip in [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()] {
+            let response = announce(&spawn_tracker(ip, None).await, &request)
+                .await
+                .unwrap();
+            assert_eq!(response.interval, 1800);
+            assert_eq!(response.complete, Some(9));
+            assert_eq!(response.incomplete, Some(5));
+            assert_eq!(response.peers, [SocketAddr::new(ip, 6881)]);
+        }
 
-        let error = announce(&spawn_tracker(Some("banned")).await, &request)
-            .await
-            .unwrap_err();
+        let tracker = spawn_tracker(Ipv4Addr::LOCALHOST.into(), Some("banned")).await;
+        let error = announce(&tracker, &request).await.unwrap_err();
         assert_eq!(error.to_string(), "banned");
     }
 }

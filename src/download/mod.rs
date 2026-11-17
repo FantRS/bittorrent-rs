@@ -138,11 +138,12 @@ mod tests {
     use super::*;
     use crate::peer::Handshake;
     use crate::peer::testing::spawn_seeder;
+    use crate::resume::ResumeData;
     use crate::storage::Storage;
     use crate::torrent::{Torrent, TorrentInfo, TorrentMeta};
     use crate::upload::seed;
-    use sha1::{Digest, Sha1};
     use std::path::Path;
+    use std::time::SystemTime;
     use tokio::net::TcpListener;
 
     const INFO_HASH: [u8; 20] = [7; 20];
@@ -160,15 +161,7 @@ mod tests {
     }
 
     async fn session(dir: &Path, peer_id: [u8; 20]) -> Arc<Session> {
-        let info = TorrentInfo {
-            name: "file".into(),
-            piece_length: 40_000,
-            pieces: data()
-                .chunks(40_000)
-                .map(|chunk| Sha1::digest(chunk).into())
-                .collect(),
-            length: 100_000,
-        };
+        let info = TorrentInfo::from_data("file", 40_000, &data());
         let storage = Storage::create(dir, &info).await.unwrap();
         let torrent = Torrent {
             meta: TorrentMeta {
@@ -203,16 +196,21 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), data());
     }
 
-    #[tokio::test]
-    async fn downloads_from_own_seeder() {
-        let seeder_dir = tempfile::tempdir().unwrap();
-        let seeder = session(seeder_dir.path(), [1; 20]).await;
+    async fn seeded(dir: &Path) -> Arc<Session> {
+        let seeder = session(dir, [1; 20]).await;
         for (index, chunk) in (0..).zip(data().chunks(40_000)) {
             seeder
                 .store_piece(index, Bytes::copy_from_slice(chunk))
                 .await
                 .unwrap();
         }
+        seeder
+    }
+
+    #[tokio::test]
+    async fn downloads_from_own_seeder() {
+        let seeder_dir = tempfile::tempdir().unwrap();
+        let seeder = seeded(seeder_dir.path()).await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -232,13 +230,46 @@ mod tests {
         assert_eq!(seeder.announce(0, None).uploaded, 100_000);
 
         let resumed = session(leecher_dir.path(), [3; 20]).await;
-        assert_eq!(resumed.resume().await.unwrap(), 3);
+        assert_eq!(resumed.resume(None).await.unwrap(), 3);
         assert!(resumed.is_complete());
         assert_eq!(resumed.announce(0, None).left, 0);
         download(resumed, queue([]), |_| {}).await.unwrap();
 
         let empty = session(tempfile::tempdir().unwrap().path(), [4; 20]).await;
-        assert_eq!(empty.resume().await.unwrap(), 0);
+        assert_eq!(empty.resume(None).await.unwrap(), 0);
         assert!(download(empty, queue([]), |_| {}).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fastresume_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = seeded(dir.path()).await.resume_data().await.unwrap();
+        let path = dir.path().join("file.fastresume");
+        saved.save(&path).await.unwrap();
+        assert_eq!(ResumeData::load(&path).await.unwrap(), saved);
+
+        let partial = ResumeData {
+            have: vec![0b1000_0000],
+            ..saved
+        };
+        let fast = session(dir.path(), [2; 20]).await;
+        assert_eq!(fast.resume(Some(partial.clone())).await.unwrap(), 1);
+        assert!(!fast.is_complete());
+
+        let foreign = ResumeData {
+            info_hash: [0; 20],
+            ..partial.clone()
+        };
+        let rehashed = session(dir.path(), [3; 20]).await;
+        assert_eq!(rehashed.resume(Some(foreign)).await.unwrap(), 3);
+
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("file"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let stale = session(dir.path(), [4; 20]).await;
+        assert_eq!(stale.resume(Some(partial)).await.unwrap(), 3);
     }
 }

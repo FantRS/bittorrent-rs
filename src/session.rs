@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::peer::Request;
+use crate::resume::ResumeData;
 use crate::storage::Storage;
 use crate::torrent::Torrent;
 use crate::tracker::{Announce, Event, announce_periodically};
@@ -44,7 +45,14 @@ impl Session {
         }
     }
 
-    pub async fn resume(self: &Arc<Self>) -> Result<usize> {
+    pub async fn resume(self: &Arc<Self>, saved: Option<ResumeData>) -> Result<usize> {
+        if let Some(saved) = saved
+            && saved.info_hash == self.torrent.info_hash
+            && saved.files == self.storage.stamps().await?
+        {
+            return Ok(self.restore(saved.have));
+        }
+
         if !self.storage.has_existing_data() {
             return Ok(0);
         }
@@ -56,6 +64,26 @@ impl Session {
         });
 
         Ok(receiver.await?)
+    }
+
+    pub async fn resume_data(&self) -> Result<ResumeData> {
+        let have = self.bitfield().to_vec();
+        self.storage.sync().await?;
+
+        Ok(ResumeData {
+            info_hash: self.torrent.info_hash,
+            have,
+            files: self.storage.stamps().await?,
+        })
+    }
+
+    fn restore(&self, raw: Vec<u8>) -> usize {
+        let mut have = BitVec::from_vec(raw);
+        have.resize(self.torrent.meta.info.piece_count(), false);
+        let count = have.count_ones();
+        *self.have.write() = have;
+
+        count
     }
 
     fn verify_existing(&self) -> usize {
