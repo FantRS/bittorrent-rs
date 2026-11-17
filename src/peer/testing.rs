@@ -18,9 +18,10 @@ pub async fn spawn_seeder(
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let Some(reply) = reply else { return };
-        if reply.exchange(&mut socket).await.is_err() {
+        if Handshake::read_from(&mut socket).await.is_err() {
             return;
         }
+        reply.write_to(&mut socket).await.unwrap();
 
         let mut frames = Framed::new(socket, MessageCodec);
         frames

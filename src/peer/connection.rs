@@ -21,8 +21,9 @@ pub struct PeerConnection {
     pub addr: SocketAddr,
     pub peer_id: [u8; 20],
     frames: Framed<TcpStream, MessageCodec>,
-    choked: bool,
-    interested: bool,
+    am_interested: bool,
+    peer_choking: bool,
+    peer_interested: bool,
     pieces: BitVec<u8, Msb0>,
 }
 
@@ -35,41 +36,61 @@ impl PeerConnection {
     ) -> Result<Self> {
         let addr = addr.into();
 
-        timeout(
-            HANDSHAKE_TIMEOUT,
-            Self::establish(addr, info_hash, peer_id, piece_count),
-        )
+        with_timeout(addr, async {
+            let mut stream = TcpStream::connect(addr).await?;
+            Handshake::new(info_hash, peer_id)
+                .write_to(&mut stream)
+                .await?;
+            let reply = Handshake::read_from(&mut stream).await?;
+            ensure!(reply.info_hash == info_hash, "info_hash mismatch");
+            ensure!(reply.peer_id != peer_id, "Connected to ourselves");
+
+            Ok(Self::new(addr, reply.peer_id, stream, piece_count))
+        })
         .await
-        .with_context(|| format!("{addr}: handshake timed out"))?
-        .with_context(|| format!("{addr}: handshake failed"))
     }
 
-    async fn establish(
-        addr: SocketAddr,
+    pub async fn accept(
+        mut stream: TcpStream,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         piece_count: usize,
     ) -> Result<Self> {
-        let mut stream = TcpStream::connect(addr).await?;
-        let reply = Handshake::new(info_hash, peer_id)
-            .exchange(&mut stream)
-            .await?;
+        let addr = stream.peer_addr()?;
 
-        ensure!(reply.info_hash == info_hash, "info_hash mismatch");
+        with_timeout(addr, async {
+            let theirs = Handshake::read_from(&mut stream).await?;
+            ensure!(theirs.info_hash == info_hash, "info_hash mismatch");
+            ensure!(theirs.peer_id != peer_id, "Connected to ourselves");
+            Handshake::new(info_hash, peer_id)
+                .write_to(&mut stream)
+                .await?;
 
-        Ok(Self {
-            addr,
-            peer_id: reply.peer_id,
-            frames: Framed::new(stream, MessageCodec),
-            choked: true,
-            interested: false,
-            pieces: BitVec::repeat(false, piece_count),
+            Ok(Self::new(addr, theirs.peer_id, stream, piece_count))
         })
+        .await
+    }
+
+    fn new(addr: SocketAddr, peer_id: [u8; 20], stream: TcpStream, piece_count: usize) -> Self {
+        Self {
+            addr,
+            peer_id,
+            frames: Framed::new(stream, MessageCodec),
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+            pieces: BitVec::repeat(false, piece_count),
+        }
     }
 
     #[must_use]
     pub fn is_choked(&self) -> bool {
-        self.choked
+        self.peer_choking
+    }
+
+    #[must_use]
+    pub fn is_peer_interested(&self) -> bool {
+        self.peer_interested
     }
 
     #[must_use]
@@ -83,9 +104,9 @@ impl PeerConnection {
     }
 
     pub async fn interested(&mut self) -> Result<()> {
-        if !self.interested {
+        if !self.am_interested {
             self.send(Message::Interested).await?;
-            self.interested = true;
+            self.am_interested = true;
         }
 
         Ok(())
@@ -103,8 +124,10 @@ impl PeerConnection {
             .ok_or_else(|| anyhow!("{}: connection closed", self.addr))??;
 
         match &message {
-            Message::Choke => self.choked = true,
-            Message::Unchoke => self.choked = false,
+            Message::Choke => self.peer_choking = true,
+            Message::Unchoke => self.peer_choking = false,
+            Message::Interested => self.peer_interested = true,
+            Message::NotInterested => self.peer_interested = false,
             Message::Have(index) => {
                 let mut bit = usize::try_from(*index)
                     .ok()
@@ -144,7 +167,7 @@ impl PeerConnection {
         let mut deadline = Instant::now() + STALL_TIMEOUT;
 
         while !queue.is_empty() || !pending.is_empty() {
-            while !self.choked
+            while !self.peer_choking
                 && pending.len() < MAX_PENDING_REQUESTS
                 && let Some(request) = queue.pop_front()
             {
@@ -152,12 +175,12 @@ impl PeerConnection {
                 pending.push(request);
             }
 
-            let was_choked = self.choked;
+            let was_choked = self.peer_choking;
             let message = timeout_at(deadline, self.recv())
                 .await
                 .with_context(|| format!("{}: piece {index} stalled", self.addr))??;
 
-            if was_choked && !self.choked {
+            if was_choked && !self.peer_choking {
                 queue.extend(pending.drain(..));
                 deadline = Instant::now() + STALL_TIMEOUT;
             }
@@ -185,6 +208,16 @@ impl PeerConnection {
 
         Ok(buf.freeze())
     }
+}
+
+async fn with_timeout(
+    addr: SocketAddr,
+    handshake: impl Future<Output = Result<PeerConnection>>,
+) -> Result<PeerConnection> {
+    timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .with_context(|| format!("{addr}: handshake timed out"))?
+        .with_context(|| format!("{addr}: handshake failed"))
 }
 
 #[cfg(test)]
@@ -220,6 +253,15 @@ mod tests {
         );
 
         let addr = spawn_seeder(seeder([9; 20]), &[0], Bytes::new(), 0).await;
+        assert!(connect(addr).await.is_err());
+
+        let addr = spawn_seeder(
+            Some(Handshake::new(info_hash, our_id)),
+            &[0],
+            Bytes::new(),
+            0,
+        )
+        .await;
         assert!(connect(addr).await.is_err());
 
         let addr = spawn_seeder(None, &[0], Bytes::new(), 0).await;

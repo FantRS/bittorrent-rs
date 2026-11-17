@@ -27,22 +27,28 @@ impl Handshake {
         }
     }
 
-    pub async fn exchange<S>(&self, stream: &mut S) -> Result<Self>
+    pub async fn write_to<S>(&self, stream: &mut S) -> Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncWrite + Unpin,
     {
         stream.write_all(self.as_bytes()).await?;
+        Ok(())
+    }
 
-        let mut reply = Self::new_zeroed();
-        stream.read_exact(reply.as_mut_bytes()).await?;
+    pub async fn read_from<S>(stream: &mut S) -> Result<Self>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut handshake = Self::new_zeroed();
+        stream.read_exact(handshake.as_mut_bytes()).await?;
 
         ensure!(
-            reply.pstrlen == PSTRLEN && &reply.pstr == PROTOCOL,
+            handshake.pstrlen == PSTRLEN && &handshake.pstr == PROTOCOL,
             "Unsupported protocol: {:?}",
-            String::from_utf8_lossy(&reply.pstr)
+            String::from_utf8_lossy(&handshake.pstr)
         );
 
-        Ok(reply)
+        Ok(handshake)
     }
 }
 
@@ -65,36 +71,32 @@ mod tests {
         assert_eq!(&bytes[48..68], &peer_id);
     }
 
-    async fn run(ours: &Handshake, reply: &[u8]) -> (Result<Handshake>, Handshake) {
+    async fn read(bytes: &[u8]) -> Result<Handshake> {
         let (mut local, mut remote) = duplex(256);
-        remote.write_all(reply).await.unwrap();
-        remote.shutdown().await.unwrap();
-
-        let result = ours.exchange(&mut local).await;
-        let mut sent = Handshake::new_zeroed();
-        remote.read_exact(sent.as_mut_bytes()).await.unwrap();
-
-        (result, sent)
+        remote.write_all(bytes).await.unwrap();
+        drop(remote);
+        Handshake::read_from(&mut local).await
     }
 
     #[tokio::test]
-    async fn exchange_cases() {
-        let ours = Handshake::new([1; 20], [2; 20]);
+    async fn stream_cases() {
         let mut theirs = Handshake::new([1; 20], [3; 20]);
         theirs.reserved[5] = 0x10;
 
-        let (reply, sent) = run(&ours, theirs.as_bytes()).await;
-        assert_eq!(reply.unwrap(), theirs);
-        assert_eq!(sent, ours);
+        let (mut local, mut remote) = duplex(256);
+        theirs.write_to(&mut local).await.unwrap();
+        assert_eq!(Handshake::read_from(&mut remote).await.unwrap(), theirs);
+
+        assert_eq!(read(theirs.as_bytes()).await.unwrap(), theirs);
 
         let mut bad_len = theirs.clone();
         bad_len.pstrlen = 18;
-        assert!(run(&ours, bad_len.as_bytes()).await.0.is_err());
+        assert!(read(bad_len.as_bytes()).await.is_err());
 
         let mut bad_pstr = theirs.clone();
         bad_pstr.pstr = *b"BitTorrent protocoX";
-        assert!(run(&ours, bad_pstr.as_bytes()).await.0.is_err());
+        assert!(read(bad_pstr.as_bytes()).await.is_err());
 
-        assert!(run(&ours, &theirs.as_bytes()[..40]).await.0.is_err());
+        assert!(read(&theirs.as_bytes()[..40]).await.is_err());
     }
 }

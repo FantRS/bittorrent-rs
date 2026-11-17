@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{self, Ipv4Addr};
+use tokio::net::TcpListener;
 
 use crate::{
     bencode::BencodeParser,
@@ -10,6 +11,7 @@ use crate::{
 pub enum Event {
     Started,
     Completed,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,9 +55,12 @@ impl Client {
     }
 
     fn generate_lst() -> Result<TcpListener> {
-        (6881..=6889)
-            .find_map(|port| TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).ok())
-            .ok_or_else(|| anyhow!("Could not bind to any port in range 6881-6889"))
+        let listener = (6881..=6889)
+            .find_map(|port| net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).ok())
+            .ok_or_else(|| anyhow!("Could not bind to any port in range 6881-6889"))?;
+        listener.set_nonblocking(true)?;
+
+        Ok(TcpListener::from_std(listener)?)
     }
 
     fn build_url(&self, torrent: &Torrent, announce: Announce) -> Result<String> {
@@ -90,6 +95,7 @@ impl Event {
         match self {
             Self::Started => "started",
             Self::Completed => "completed",
+            Self::Stopped => "stopped",
         }
     }
 }
