@@ -35,4 +35,5 @@ zerocopy = { version = "0.8.63", features = ["derive"] }
 tokio-util = { version = "0.7.20", features = ["codec"] }
 bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+bitvec = "1.1.1"
 
