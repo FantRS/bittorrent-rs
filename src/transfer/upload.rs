@@ -53,11 +53,7 @@ async fn serve(
     let info_hash = session.torrent.info_hash;
     let piece_count = session.torrent.meta.info.piece_count();
     let mut conn = PeerConnection::accept(stream, info_hash, session.peer_id, piece_count).await?;
-    info!(
-        "{}: incoming peer ({})",
-        conn.addr,
-        String::from_utf8_lossy(&conn.peer_id())
-    );
+    info!("{}: incoming peer ({})", conn.addr, conn.peer_id());
 
     let mut completed = session.subscribe();
     let mut slot: Option<OwnedSemaphorePermit> = None;

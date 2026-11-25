@@ -47,6 +47,7 @@ fn encode_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
     buf.extend_from_slice(bytes);
 }
 
+/// Extension methods for taking typed values out of a bencode dictionary.
 pub trait DictExt {
     fn take<T>(&mut self, key: &str) -> Result<T>
     where

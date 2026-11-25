@@ -12,7 +12,8 @@ use tokio_util::codec::Framed;
 use tracing::debug;
 
 use crate::peer::extension::{self, MetadataMessage, RemoteExtensions};
-use crate::peer::{Handshake, Message, MessageCodec, Request};
+use crate::peer::{Handshake, Message, MessageCodec, PeerId, Request};
+use crate::torrent::{InfoHash, PieceIndex};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOCK_LEN: u32 = 1 << 14;
@@ -35,8 +36,8 @@ pub struct PeerConnection {
 impl PeerConnection {
     pub async fn connect(
         addr: impl Into<SocketAddr>,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
+        info_hash: InfoHash,
+        peer_id: PeerId,
         piece_count: Option<usize>,
     ) -> Result<Self> {
         let addr = addr.into();
@@ -57,8 +58,8 @@ impl PeerConnection {
 
     pub async fn accept(
         mut stream: TcpStream,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
+        info_hash: InfoHash,
+        peer_id: PeerId,
         piece_count: usize,
     ) -> Result<Self> {
         let addr = stream.peer_addr()?;
@@ -96,7 +97,7 @@ impl PeerConnection {
     }
 
     #[must_use]
-    pub fn peer_id(&self) -> [u8; 20] {
+    pub fn peer_id(&self) -> PeerId {
         self.handshake.peer_id
     }
 
@@ -127,16 +128,11 @@ impl PeerConnection {
     }
 
     #[must_use]
-    pub fn has_piece(&self, index: usize) -> bool {
+    pub fn has_piece(&self, index: PieceIndex) -> bool {
         self.pieces
             .as_ref()
-            .and_then(|pieces| pieces.get(index))
+            .and_then(|pieces| pieces.get(index.as_usize()))
             .is_some_and(|bit| *bit)
-    }
-
-    #[must_use]
-    pub fn has_any_piece(&self) -> bool {
-        self.pieces.as_ref().is_some_and(|pieces| pieces.any())
     }
 
     #[must_use]
@@ -216,9 +212,8 @@ impl PeerConnection {
             Message::NotInterested => self.peer_interested = false,
             Message::Have(index) => {
                 if let Some(pieces) = &mut self.pieces {
-                    let mut bit = usize::try_from(*index)
-                        .ok()
-                        .and_then(|index| pieces.get_mut(index))
+                    let mut bit = pieces
+                        .get_mut(index.as_usize())
                         .ok_or_else(|| anyhow!("Invalid piece index: {index}"))?;
                     *bit = true;
                 }
@@ -278,7 +273,7 @@ impl PeerConnection {
         Ok(message)
     }
 
-    pub async fn download_piece(&mut self, index: u32, length: u32) -> Result<Bytes> {
+    pub async fn download_piece(&mut self, index: PieceIndex, length: u32) -> Result<Bytes> {
         let mut queue: VecDeque<Request> = (0..length.div_ceil(BLOCK_LEN))
             .map(|block| {
                 let begin = block * BLOCK_LEN;
@@ -294,12 +289,16 @@ impl PeerConnection {
         let mut deadline = Instant::now() + STALL_TIMEOUT;
 
         while !queue.is_empty() || !pending.is_empty() {
+            let requested = pending.len();
             while !self.peer_choking
                 && pending.len() < MAX_PENDING_REQUESTS
                 && let Some(request) = queue.pop_front()
             {
-                self.send(Message::Request(request)).await?;
+                self.frames.feed(Message::Request(request)).await?;
                 pending.push(request);
+            }
+            if pending.len() > requested {
+                self.frames.flush().await?;
             }
 
             let was_choked = self.peer_choking;
@@ -355,9 +354,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_cases() {
-        let info_hash = [7; 20];
-        let our_id = *b"-RS0001-abcdefghijkl";
-        let their_id = *b"-XX0001-000000000000";
+        let info_hash = InfoHash::from([7; 20]);
+        let our_id = PeerId::from(*b"-RS0001-abcdefghijkl");
+        let their_id = PeerId::from(*b"-XX0001-000000000000");
         let data: Bytes = (0..=u8::MAX).cycle().take(80_000).collect();
         let connect = |addr| PeerConnection::connect(addr, info_hash, our_id, Some(2));
         let seeder = |hash| Some(Handshake::new(hash, their_id));
@@ -371,16 +370,15 @@ mod tests {
         while conn.is_choked() {
             conn.recv().await.unwrap();
         }
-        assert!(conn.has_any_piece());
-        assert!(conn.has_piece(1));
-        assert!(!conn.has_piece(0));
-        assert!(!conn.has_piece(2));
+        assert!(conn.has_piece(1.into()));
+        assert!(!conn.has_piece(0.into()));
+        assert!(!conn.has_piece(2.into()));
         assert_eq!(
-            conn.download_piece(1, 40_000).await.unwrap(),
+            conn.download_piece(1.into(), 40_000).await.unwrap(),
             data.slice(40_000..)
         );
 
-        let addr = spawn_seeder(seeder([9; 20]), &[0], Bytes::new(), 0).await;
+        let addr = spawn_seeder(seeder([9; 20].into()), &[0], Bytes::new(), 0).await;
         assert!(connect(addr).await.is_err());
 
         let addr = spawn_seeder(
@@ -398,14 +396,14 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_cases() {
-        let info_hash = [7; 20];
+        let info_hash = InfoHash::from([7; 20]);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let remote = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let ours = Handshake::read_from(&mut stream).await.unwrap();
-            Handshake::new(info_hash, [1; 20])
+            Handshake::new(info_hash, [1; 20].into())
                 .write_to(&mut stream)
                 .await
                 .unwrap();
@@ -424,7 +422,7 @@ mod tests {
             (ours.supports_extensions(), handshake)
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2; 20], Some(1))
+        let mut conn = PeerConnection::connect(addr, info_hash, [2; 20].into(), Some(1))
             .await
             .unwrap();
         let (sender, mut receiver) = mpsc::channel(4);

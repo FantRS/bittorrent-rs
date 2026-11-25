@@ -3,6 +3,7 @@ use sha1::{Digest, Sha1};
 use std::path::{Component, Path, PathBuf};
 
 use crate::bencode::{BencodeValue, Dict, DictExt};
+use crate::torrent::PieceIndex;
 
 #[derive(Debug)]
 pub struct TorrentMeta {
@@ -63,6 +64,10 @@ impl TryFrom<BencodeValue> for TorrentInfo {
         let pieces: Vec<u8> = dict.take("pieces")?;
         let (hashes, rest) = pieces.as_chunks::<20>();
         ensure!(rest.is_empty(), "'pieces' length is not a multiple of 20");
+        ensure!(
+            u32::try_from(hashes.len()).is_ok(),
+            "Torrent has too many pieces"
+        );
 
         let root = PathBuf::from(safe_component(&name)?);
         let files = match dict.take_opt::<Vec<BencodeValue>>("files") {
@@ -103,8 +108,8 @@ impl TorrentInfo {
     }
 
     #[must_use]
-    pub fn piece_len(&self, index: u32) -> Option<u32> {
-        let start = u64::from(index).checked_mul(self.piece_length)?;
+    pub fn piece_len(&self, index: PieceIndex) -> Option<u32> {
+        let start = u64::from(index.get()).checked_mul(self.piece_length)?;
         let len = self
             .length
             .checked_sub(start)
@@ -115,10 +120,9 @@ impl TorrentInfo {
     }
 
     #[must_use]
-    pub fn verify(&self, index: u32, data: &[u8]) -> bool {
-        usize::try_from(index)
-            .ok()
-            .and_then(|i| self.pieces.get(i))
+    pub fn verify(&self, index: PieceIndex, data: &[u8]) -> bool {
+        self.pieces
+            .get(index.as_usize())
             .is_some_and(|hash| Sha1::digest(data).as_slice() == hash)
     }
 }
@@ -288,14 +292,14 @@ mod tests {
         let info = TorrentInfo::from_data("file", 4, b"abcdef");
 
         assert_eq!(info.piece_count(), 2);
-        assert_eq!(info.piece_len(0), Some(4));
-        assert_eq!(info.piece_len(1), Some(2));
-        assert_eq!(info.piece_len(2), None);
-        assert_eq!(info.piece_len(u32::MAX), None);
+        assert_eq!(info.piece_len(0.into()), Some(4));
+        assert_eq!(info.piece_len(1.into()), Some(2));
+        assert_eq!(info.piece_len(2.into()), None);
+        assert_eq!(info.piece_len(u32::MAX.into()), None);
 
-        assert!(info.verify(0, b"abcd"));
-        assert!(info.verify(1, b"ef"));
-        assert!(!info.verify(1, b"eg"));
-        assert!(!info.verify(2, b""));
+        assert!(info.verify(0.into(), b"abcd"));
+        assert!(info.verify(1.into(), b"ef"));
+        assert!(!info.verify(1.into(), b"eg"));
+        assert!(!info.verify(2.into(), b""));
     }
 }

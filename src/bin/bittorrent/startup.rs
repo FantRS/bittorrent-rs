@@ -8,12 +8,12 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use bittorrent_rs::dht::Dht;
+use bittorrent_rs::discovery::Discovery;
 use bittorrent_rs::session::{Client, Session};
 use bittorrent_rs::storage::{ResumeData, Storage};
 use bittorrent_rs::torrent::{Magnet, Torrent};
-use bittorrent_rs::tracker::{Event, announce_all};
-use bittorrent_rs::transfer::metadata::resolve;
-use bittorrent_rs::transfer::{download, seed};
+use bittorrent_rs::tracker::{Event, TrackerClient};
+use bittorrent_rs::transfer::{download, resolve, seed};
 
 use crate::args::Args;
 
@@ -34,7 +34,8 @@ pub async fn start() -> Result<()> {
     let dht = Dht::start()
         .inspect_err(|e| warn!("DHT is unavailable: {e:#}"))
         .ok();
-    let torrent = load(&args.path, &client, port, dht.as_ref()).await?;
+    let discovery = Discovery::new(TrackerClient::new()?, dht);
+    let torrent = load(&args.path, &client, port, &discovery).await?;
     let resume_path = args
         .output
         .join(format!("{}.fastresume", torrent.meta.info.name));
@@ -53,24 +54,24 @@ pub async fn start() -> Result<()> {
         );
     }
 
-    let result = run(&session, &client, port, dht.as_ref()).await;
+    let result = run(&session, &client, port, &discovery).await;
 
     if let Err(e) = save(&session, &resume_path).await {
         warn!("Failed to save fastresume data: {e:#}");
     }
-    announce(&session, port, Event::Stopped).await;
+    announce(&discovery, &session, port, Event::Stopped).await;
 
     result
 }
 
-async fn load(source: &str, client: &Client, port: u16, dht: Option<&Dht>) -> Result<Torrent> {
+async fn load(source: &str, client: &Client, port: u16, discovery: &Discovery) -> Result<Torrent> {
     if !source.starts_with("magnet:") {
-        return Torrent::load(source);
+        return Torrent::load(source).await;
     }
 
     let magnet: Magnet = source.parse()?;
     tokio::select! {
-        torrent = resolve(&magnet, client.id, port, dht) => torrent,
+        torrent = resolve(&magnet, client.id, port, discovery) => torrent,
         result = signal::ctrl_c() => {
             result?;
             bail!("Interrupted while fetching metadata")
@@ -78,7 +79,12 @@ async fn load(source: &str, client: &Client, port: u16, dht: Option<&Dht>) -> Re
     }
 }
 
-async fn run(session: &Arc<Session>, client: &Client, port: u16, dht: Option<&Dht>) -> Result<()> {
+async fn run(
+    session: &Arc<Session>,
+    client: &Client,
+    port: u16,
+    discovery: &Discovery,
+) -> Result<()> {
     let already_complete = session.is_complete();
     let progress = ProgressBar::new(session.torrent.meta.info.length)
         .with_position(session.verified_bytes())
@@ -87,9 +93,9 @@ async fn run(session: &Arc<Session>, client: &Client, port: u16, dht: Option<&Dh
         )?);
 
     let (peers_sender, peers) = mpsc::channel(PEER_QUEUE);
-    let announcing = session.run_announcer(port, peers_sender.clone(), dht);
+    let announcing = session.run_announcer(port, peers_sender.clone(), discovery);
     let downloading = download(Arc::clone(session), peers, |len| progress.inc(len));
-    let seeding = seed(Arc::clone(session), &client.lst, peers_sender);
+    let seeding = seed(Arc::clone(session), &client.listener, peers_sender);
     tokio::pin!(announcing, seeding);
 
     tokio::select! {
@@ -99,7 +105,7 @@ async fn run(session: &Arc<Session>, client: &Client, port: u16, dht: Option<&Dh
             result?;
             progress.finish();
             if !already_complete {
-                announce(session, port, Event::Completed).await;
+                announce(discovery, session, port, Event::Completed).await;
             }
             info!("Download complete, seeding until Ctrl+C");
 
@@ -119,10 +125,11 @@ async fn save(session: &Session, path: &Path) -> Result<()> {
     session.resume_data().await?.save(path).await
 }
 
-async fn announce(session: &Session, port: u16, event: Event) {
-    announce_all(
-        &session.torrent.meta.trackers,
-        session.announce(port, Some(event)),
-    )
-    .await;
+async fn announce(discovery: &Discovery, session: &Session, port: u16, event: Event) {
+    discovery
+        .announce_all(
+            &session.torrent.meta.trackers,
+            session.announce(port, Some(event)),
+        )
+        .await;
 }

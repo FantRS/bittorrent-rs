@@ -1,10 +1,14 @@
-pub mod magnet;
-pub mod meta;
+mod info_hash;
+mod magnet;
+mod meta;
+mod piece_index;
 
+pub use info_hash::InfoHash;
 pub use magnet::Magnet;
 pub use meta::{FileEntry, TorrentInfo, TorrentMeta};
+pub use piece_index::PieceIndex;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::bencode::BencodeParser;
@@ -12,22 +16,21 @@ use crate::bencode::BencodeParser;
 #[derive(Debug)]
 pub struct Torrent {
     pub meta: TorrentMeta,
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
 }
 
 impl Torrent {
-    pub fn load<P>(path: P) -> Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let bytes = std::fs::read(path)?;
+    pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let bytes = tokio::fs::read(path).await?;
         let mut parser = BencodeParser::new(bytes);
         let bencode_tree = parser.parse()?;
 
         let meta = bencode_tree.try_into()?;
-        let info_hash = parser
-            .info_hash()
-            .ok_or_else(|| anyhow!("Info hash getting error"))?;
+        let info_hash = InfoHash::of(
+            parser
+                .info_bytes()
+                .context("Torrent has no 'info' dictionary")?,
+        );
 
         Ok(Self { meta, info_hash })
     }

@@ -1,5 +1,7 @@
 pub mod bencode;
+mod cpu;
 pub mod dht;
+pub mod discovery;
 pub mod peer;
 pub mod session;
 pub mod storage;

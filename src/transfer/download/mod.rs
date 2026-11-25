@@ -5,12 +5,14 @@ use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
+use crate::cpu;
 use crate::peer::PeerConnection;
 use crate::session::Session;
+use crate::torrent::PieceIndex;
 use crate::transfer::swarm::Swarm;
 use picker::Picker;
 
@@ -27,7 +29,7 @@ pub async fn download(
     let missing = session.missing();
     let mut remaining = missing.count_ones();
     let picker = Arc::new(Picker::new(missing));
-    let (sender, mut pieces) = mpsc::channel::<(u32, Bytes)>(PIECE_BUFFER);
+    let (sender, mut pieces) = mpsc::channel::<(PieceIndex, Bytes)>(PIECE_BUFFER);
     let (exchange, mut exchanged) = mpsc::channel(EXCHANGE_BUFFER);
     let mut swarm = Swarm::new(MAX_PEERS);
 
@@ -78,17 +80,14 @@ async fn run_peer(
     addr: SocketAddr,
     session: Arc<Session>,
     picker: Arc<Picker>,
-    pieces: mpsc::Sender<(u32, Bytes)>,
+    pieces: mpsc::Sender<(PieceIndex, Bytes)>,
     exchange: mpsc::Sender<Vec<SocketAddr>>,
 ) -> Result<()> {
     let info = &session.torrent.meta.info;
     let info_hash = session.torrent.info_hash;
     let mut conn =
         PeerConnection::connect(addr, info_hash, session.peer_id, Some(info.piece_count())).await?;
-    info!(
-        "{addr}: connected ({})",
-        String::from_utf8_lossy(&conn.peer_id())
-    );
+    info!("{addr}: connected ({})", conn.peer_id());
 
     conn.enable_extensions(exchange).await?;
     conn.interested().await?;
@@ -115,7 +114,7 @@ async fn run_peer(
             continue;
         };
 
-        let index = u32::try_from(reservation.index())?;
+        let index = reservation.index();
         let length = info
             .piece_len(index)
             .with_context(|| format!("Invalid piece index: {index}"))?;
@@ -133,13 +132,8 @@ async fn run_peer(
     Ok(())
 }
 
-async fn verify(session: Arc<Session>, index: u32, piece: Bytes) -> Result<bool> {
-    let (sender, receiver) = oneshot::channel();
-    rayon::spawn(move || {
-        let _ = sender.send(session.torrent.meta.info.verify(index, &piece));
-    });
-
-    Ok(receiver.await?)
+async fn verify(session: Arc<Session>, index: PieceIndex, piece: Bytes) -> Result<bool> {
+    cpu::spawn(move || session.torrent.meta.info.verify(index, &piece)).await
 }
 
 #[cfg(test)]
@@ -174,15 +168,15 @@ mod tests {
                 trackers: Vec::new(),
                 info,
             },
-            info_hash: INFO_HASH,
+            info_hash: INFO_HASH.into(),
         };
 
-        Arc::new(Session::new(torrent, peer_id, storage))
+        Arc::new(Session::new(torrent, peer_id.into(), storage))
     }
 
     #[tokio::test]
     async fn downloads_from_many_peers() {
-        let reply = || Some(Handshake::new(INFO_HASH, [1; 20]));
+        let reply = || Some(Handshake::new(INFO_HASH.into(), [1; 20].into()));
         let corrupt = Bytes::from(vec![0; 100_000]);
         let peers = [
             spawn_seeder(reply(), &[0b1110_0000], corrupt, 40_000).await,
@@ -204,9 +198,9 @@ mod tests {
 
     async fn seeded(dir: &Path) -> Arc<Session> {
         let seeder = session(dir, [1; 20]).await;
-        for (index, chunk) in (0..).zip(data().chunks(40_000)) {
+        for (index, chunk) in (0u32..).zip(data().chunks(40_000)) {
             seeder
-                .store_piece(index, Bytes::copy_from_slice(chunk))
+                .store_piece(index.into(), Bytes::copy_from_slice(chunk))
                 .await
                 .unwrap();
         }
@@ -264,7 +258,7 @@ mod tests {
         assert!(!fast.is_complete());
 
         let foreign = ResumeData {
-            info_hash: [0; 20],
+            info_hash: [0; 20].into(),
             ..partial.clone()
         };
         let rehashed = session(dir.path(), [3; 20]).await;

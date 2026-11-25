@@ -3,6 +3,8 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::torrent::PieceIndex;
+
 #[derive(Debug)]
 pub struct Picker {
     state: Mutex<State>,
@@ -18,7 +20,7 @@ struct State {
 #[derive(Debug)]
 pub struct Reservation {
     picker: Arc<Picker>,
-    index: usize,
+    index: PieceIndex,
     completed: bool,
 }
 
@@ -34,13 +36,13 @@ impl Picker {
         }
     }
 
-    pub fn reserve(self: &Arc<Self>, has_piece: impl Fn(usize) -> bool) -> Option<Reservation> {
+    pub fn reserve(
+        self: &Arc<Self>,
+        has_piece: impl Fn(PieceIndex) -> bool,
+    ) -> Option<Reservation> {
         let mut state = self.state.lock();
-        let index = state
-            .available
-            .iter_ones()
-            .find(|&index| has_piece(index))?;
-        state.available.set(index, false);
+        let index = indices(&state.available).find(|&index| has_piece(index))?;
+        state.available.set(index.as_usize(), false);
 
         Some(Reservation {
             picker: Arc::clone(self),
@@ -50,8 +52,8 @@ impl Picker {
     }
 
     #[must_use]
-    pub fn wants(&self, has_piece: impl Fn(usize) -> bool) -> bool {
-        self.state.lock().missing.iter_ones().any(has_piece)
+    pub fn wants(&self, has_piece: impl Fn(PieceIndex) -> bool) -> bool {
+        indices(&self.state.lock().missing).any(has_piece)
     }
 
     #[must_use]
@@ -64,22 +66,32 @@ impl Picker {
         self.released.subscribe()
     }
 
-    fn release(&self, index: usize) {
-        self.state.lock().available.set(index, true);
+    fn release(&self, index: PieceIndex) {
+        self.state.lock().available.set(index.as_usize(), true);
         self.released.send_replace(());
     }
 }
 
 impl Reservation {
     #[must_use]
-    pub fn index(&self) -> usize {
+    pub fn index(&self) -> PieceIndex {
         self.index
     }
 
     pub fn complete(mut self) {
-        self.picker.state.lock().missing.set(self.index, false);
+        self.picker
+            .state
+            .lock()
+            .missing
+            .set(self.index.as_usize(), false);
         self.completed = true;
     }
+}
+
+fn indices(pieces: &BitVec) -> impl Iterator<Item = PieceIndex> {
+    pieces
+        .iter_ones()
+        .filter_map(|index| PieceIndex::try_from(index).ok())
 }
 
 impl Drop for Reservation {
@@ -100,21 +112,21 @@ mod tests {
         let released = picker.subscribe();
 
         let first = picker.reserve(|_| true).unwrap();
-        assert_eq!(first.index(), 0);
+        assert_eq!(first.index().get(), 0);
         let second = picker.reserve(|_| true).unwrap();
-        assert_eq!(second.index(), 1);
-        assert!(picker.reserve(|index| index < 2).is_none());
+        assert_eq!(second.index().get(), 1);
+        assert!(picker.reserve(|index| index.get() < 2).is_none());
 
         drop(second);
         assert!(released.has_changed().unwrap());
-        let retry = picker.reserve(|index| index == 1).unwrap();
-        assert_eq!(retry.index(), 1);
+        let retry = picker.reserve(|index| index.get() == 1).unwrap();
+        assert_eq!(retry.index().get(), 1);
 
-        assert!(picker.wants(|index| index == 1));
+        assert!(picker.wants(|index| index.get() == 1));
         first.complete();
         retry.complete();
-        assert!(!picker.wants(|index| index < 2));
-        assert!(picker.wants(|index| index == 2));
+        assert!(!picker.wants(|index| index.get() < 2));
+        assert!(picker.wants(|index| index.get() == 2));
         assert!(!picker.is_done());
 
         picker.reserve(|_| true).unwrap().complete();

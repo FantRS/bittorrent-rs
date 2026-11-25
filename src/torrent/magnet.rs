@@ -3,9 +3,11 @@ use data_encoding::{BASE32, HEXLOWER_PERMISSIVE};
 use std::str::FromStr;
 use url::Url;
 
+use crate::torrent::InfoHash;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Magnet {
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
     pub name: Option<String>,
     pub trackers: Vec<String>,
     pub peers: Vec<String>,
@@ -52,15 +54,15 @@ impl FromStr for Magnet {
     }
 }
 
-fn parse_info_hash(hash: &str) -> Result<[u8; 20]> {
+fn parse_info_hash(hash: &str) -> Result<InfoHash> {
     let bytes = match hash.len() {
         40 => HEXLOWER_PERMISSIVE.decode(hash.as_bytes())?,
         32 => BASE32.decode(hash.to_ascii_uppercase().as_bytes())?,
         len => bail!("Invalid info hash length: {len}"),
     };
 
-    bytes
-        .try_into()
+    <[u8; 20]>::try_from(bytes)
+        .map(InfoHash::from)
         .map_err(|_| anyhow!("Invalid info hash: {hash}"))
 }
 
@@ -83,7 +85,7 @@ mod tests {
         assert_eq!(
             magnet,
             Magnet {
-                info_hash: HASH,
+                info_hash: HASH.into(),
                 name: Some("ubuntu 26.04".into()),
                 trackers: vec![
                     "udp://tracker.example:1337/announce".into(),
@@ -97,7 +99,7 @@ mod tests {
             "magnet:?xt=urn:btmh:1220aa&xt=urn:btih:3l6iyb3mulz62n3o5lt4o2qnnprecxcf"
                 .parse()
                 .unwrap();
-        assert_eq!(base32.info_hash, HASH);
+        assert_eq!(base32.info_hash, HASH.into());
         assert!(base32.name.is_none() && base32.trackers.is_empty());
 
         assert!("magnet:?dn=x".parse::<Magnet>().is_err());

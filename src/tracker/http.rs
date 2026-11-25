@@ -1,4 +1,6 @@
 use anyhow::Result;
+use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
+use reqwest::Client;
 use std::fmt::Write;
 use url::Url;
 
@@ -7,7 +9,11 @@ use crate::tracker::{Announce, TrackerResponse};
 
 const NUM_WANT: u32 = 100;
 
-pub async fn announce(mut url: Url, request: &Announce) -> Result<TrackerResponse> {
+pub async fn announce(
+    client: &Client,
+    mut url: Url,
+    request: &Announce,
+) -> Result<TrackerResponse> {
     let mut query = url.query().map(str::to_owned).unwrap_or_default();
     if !query.is_empty() {
         query.push('&');
@@ -16,8 +22,8 @@ pub async fn announce(mut url: Url, request: &Announce) -> Result<TrackerRespons
     write!(
         query,
         "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1&numwant={NUM_WANT}",
-        urlencoding::encode_binary(&request.info_hash),
-        urlencoding::encode_binary(&request.peer_id),
+        percent_encode(request.info_hash.as_ref(), NON_ALPHANUMERIC),
+        percent_encode(request.peer_id.as_ref(), NON_ALPHANUMERIC),
         request.port,
         request.uploaded,
         request.downloaded,
@@ -28,7 +34,13 @@ pub async fn announce(mut url: Url, request: &Announce) -> Result<TrackerRespons
     }
     url.set_query(Some(&query));
 
-    let body = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+    let body = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
 
     BencodeParser::new(body.to_vec()).parse()?.try_into()
 }

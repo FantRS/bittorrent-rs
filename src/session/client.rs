@@ -4,33 +4,29 @@ use std::io;
 use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::TcpListener;
 
+use crate::peer::PeerId;
+
 const LISTEN_BACKLOG: i32 = 128;
 
 #[derive(Debug)]
 pub struct Client {
-    pub id: [u8; 20],
-    pub lst: TcpListener,
+    pub id: PeerId,
+    pub listener: TcpListener,
 }
 
 impl Client {
     pub fn build() -> Result<Self> {
-        let id = Self::generate_id();
-        let lst = Self::generate_lst()?;
-
-        Ok(Self { id, lst })
+        Ok(Self {
+            id: PeerId::generate(),
+            listener: Self::bind_listener()?,
+        })
     }
 
     pub fn port(&self) -> Result<u16> {
-        Ok(self.lst.local_addr()?.port())
+        Ok(self.listener.local_addr()?.port())
     }
 
-    fn generate_id() -> [u8; 20] {
-        let mut id: [u8; 20] = rand::random();
-        id[..8].copy_from_slice(b"-RS0001-");
-        id
-    }
-
-    fn generate_lst() -> Result<TcpListener> {
+    fn bind_listener() -> Result<TcpListener> {
         let listener = (6881..=6889)
             .flat_map(|port| {
                 [
@@ -70,14 +66,14 @@ mod tests {
         let client = Client::build().unwrap();
         let port = client.port().unwrap();
         assert!((6881..=6889).contains(&port));
-        assert!(client.id.starts_with(b"-RS0001-"));
+        assert!(client.id.as_ref().starts_with(b"-RS0001-"));
 
         for ip in [
             IpAddr::from(Ipv4Addr::LOCALHOST),
             Ipv6Addr::LOCALHOST.into(),
         ] {
             let stream = TcpStream::connect((ip, port)).await.unwrap();
-            let (_, remote) = client.lst.accept().await.unwrap();
+            let (_, remote) = client.listener.accept().await.unwrap();
             assert_eq!(remote.ip().to_canonical(), ip);
             assert_eq!(remote.port(), stream.local_addr().unwrap().port());
         }

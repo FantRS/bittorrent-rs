@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::warn;
 
 use crate::bencode::{BencodeValue, Dict, DictExt};
@@ -7,12 +8,8 @@ use crate::peer::compact::parse_compact_peers;
 
 #[derive(Debug)]
 pub struct TrackerResponse {
-    pub interval: u64,
+    pub interval: Duration,
     pub peers: Vec<SocketAddr>,
-
-    pub tracker_id: Option<Vec<u8>>,
-    pub complete: Option<u64>,
-    pub incomplete: Option<u64>,
 }
 
 impl TryFrom<BencodeValue> for TrackerResponse {
@@ -41,11 +38,8 @@ impl TryFrom<BencodeValue> for TrackerResponse {
         }
 
         Ok(Self {
-            interval: dict.take("interval")?,
+            interval: Duration::from_secs(dict.take("interval")?),
             peers,
-            tracker_id: dict.take_opt("tracker id"),
-            complete: dict.take_opt("complete"),
-            incomplete: dict.take_opt("incomplete"),
         })
     }
 }
@@ -71,7 +65,7 @@ mod tests {
     fn response_cases() {
         let compact =
             parse(b"d8:intervali1800e5:peers12:\x7f\0\0\x01\x1a\xe1\x0a\0\0\x02\0\x50e").unwrap();
-        assert_eq!(compact.interval, 1800);
+        assert_eq!(compact.interval, Duration::from_mins(30));
         assert_eq!(
             compact.peers,
             [

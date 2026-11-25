@@ -7,7 +7,9 @@ use url::{Host, Url};
 use zerocopy::network_endian::{I32, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::peer::PeerId;
 use crate::peer::compact::parse_compact_peers;
+use crate::torrent::InfoHash;
 use crate::tracker::{Announce, Event, TrackerResponse};
 
 const PROTOCOL_ID: u64 = 0x0417_2710_1980;
@@ -32,8 +34,8 @@ struct AnnounceRequest {
     connection_id: U64,
     action: U32,
     transaction_id: U32,
-    info_hash: [u8; 20],
-    peer_id: [u8; 20],
+    info_hash: InfoHash,
+    peer_id: PeerId,
     downloaded: U64,
     left: U64,
     uploaded: U64,
@@ -55,8 +57,7 @@ struct Header {
 #[repr(C)]
 struct AnnounceResponse {
     interval: U32,
-    leechers: U32,
-    seeders: U32,
+    leechers_and_seeders: [U32; 2],
 }
 
 pub async fn announce(url: &Url, request: &Announce) -> Result<TrackerResponse> {
@@ -104,11 +105,8 @@ pub async fn announce(url: &Url, request: &Announce) -> Result<TrackerResponse> 
     };
 
     Ok(TrackerResponse {
-        interval: body.interval.get().into(),
+        interval: Duration::from_secs(body.interval.get().into()),
         peers,
-        tracker_id: None,
-        complete: Some(body.seeders.get().into()),
-        incomplete: Some(body.leechers.get().into()),
     })
 }
 
@@ -219,8 +217,8 @@ mod tests {
     #[tokio::test]
     async fn announce_cases() {
         let request = Announce {
-            info_hash: [1; 20],
-            peer_id: [2; 20],
+            info_hash: [1; 20].into(),
+            peer_id: [2; 20].into(),
             port: 6881,
             uploaded: 0,
             downloaded: 0,
@@ -233,9 +231,7 @@ mod tests {
             let response = announce(&spawn_tracker(ip, None).await, &request)
                 .await
                 .unwrap();
-            assert_eq!(response.interval, 1800);
-            assert_eq!(response.complete, Some(9));
-            assert_eq!(response.incomplete, Some(5));
+            assert_eq!(response.interval, Duration::from_mins(30));
             assert_eq!(response.peers, [SocketAddr::new(ip, 6881)]);
         }
 

@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, info};
 
+use crate::torrent::InfoHash;
+
 const ANNOUNCE_INTERVAL: Duration = Duration::from_mins(15);
+const RETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Clone)]
 pub struct Dht(AsyncDht);
@@ -20,20 +23,22 @@ impl Dht {
 
     pub async fn announce_periodically(
         &self,
-        info_hash: [u8; 20],
+        info_hash: InfoHash,
         port: u16,
         peers: &mpsc::Sender<Vec<SocketAddr>>,
     ) {
-        let id = Id::from(info_hash);
+        let id = Id::from(<[u8; 20]>::from(info_hash));
 
         loop {
             let found = self.lookup(id, peers).await;
-            info!(
-                "DHT: {found} peers, next lookup in {}s",
-                ANNOUNCE_INTERVAL.as_secs()
-            );
+            let delay = if found == 0 {
+                RETRY_INTERVAL
+            } else {
+                ANNOUNCE_INTERVAL
+            };
+            info!("DHT: {found} peers, next lookup in {}s", delay.as_secs());
             self.announce(id, port).await;
-            sleep(ANNOUNCE_INTERVAL).await;
+            sleep(delay).await;
         }
     }
 

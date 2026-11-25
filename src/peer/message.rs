@@ -3,18 +3,34 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::mem;
 use tokio_util::codec::{Decoder, Encoder};
 
+use crate::torrent::PieceIndex;
+
 const MAX_FRAME_LEN: usize = 1 << 20;
+
+mod id {
+    pub const CHOKE: u8 = 0;
+    pub const UNCHOKE: u8 = 1;
+    pub const INTERESTED: u8 = 2;
+    pub const NOT_INTERESTED: u8 = 3;
+    pub const HAVE: u8 = 4;
+    pub const BITFIELD: u8 = 5;
+    pub const REQUEST: u8 = 6;
+    pub const PIECE: u8 = 7;
+    pub const CANCEL: u8 = 8;
+    pub const PORT: u8 = 9;
+    pub const EXTENDED: u8 = 20;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Request {
-    pub index: u32,
+    pub index: PieceIndex,
     pub begin: u32,
     pub length: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Piece {
-    pub index: u32,
+    pub index: PieceIndex,
     pub begin: u32,
     pub block: Bytes,
 }
@@ -26,7 +42,7 @@ pub enum Message {
     Unchoke,
     Interested,
     NotInterested,
-    Have(u32),
+    Have(PieceIndex),
     Bitfield(Bytes),
     Request(Request),
     Piece(Piece),
@@ -62,30 +78,30 @@ impl Decoder for MessageCodec {
             return Ok(Some(Message::KeepAlive));
         }
 
-        let id = payload.try_get_u8()?;
-        let message = match id {
-            0 => Message::Choke,
-            1 => Message::Unchoke,
-            2 => Message::Interested,
-            3 => Message::NotInterested,
-            4 => Message::Have(payload.try_get_u32()?),
-            5 => Message::Bitfield(mem::take(&mut payload)),
-            6 => Message::Request(Request::decode(&mut payload)?),
-            7 => Message::Piece(Piece {
-                index: payload.try_get_u32()?,
+        let kind = payload.try_get_u8()?;
+        let message = match kind {
+            id::CHOKE => Message::Choke,
+            id::UNCHOKE => Message::Unchoke,
+            id::INTERESTED => Message::Interested,
+            id::NOT_INTERESTED => Message::NotInterested,
+            id::HAVE => Message::Have(payload.try_get_u32()?.into()),
+            id::BITFIELD => Message::Bitfield(mem::take(&mut payload)),
+            id::REQUEST => Message::Request(Request::decode(&mut payload)?),
+            id::PIECE => Message::Piece(Piece {
+                index: payload.try_get_u32()?.into(),
                 begin: payload.try_get_u32()?,
                 block: mem::take(&mut payload),
             }),
-            8 => Message::Cancel(Request::decode(&mut payload)?),
-            9 => Message::Port(payload.try_get_u16()?),
-            20 => Message::Extended {
+            id::CANCEL => Message::Cancel(Request::decode(&mut payload)?),
+            id::PORT => Message::Port(payload.try_get_u16()?),
+            id::EXTENDED => Message::Extended {
                 id: payload.try_get_u8()?,
                 payload: mem::take(&mut payload),
             },
-            _ => bail!("Unknown message id: {id}"),
+            _ => bail!("Unknown message id: {kind}"),
         };
 
-        ensure!(payload.is_empty(), "Malformed message with id {id}");
+        ensure!(payload.is_empty(), "Malformed message with id {kind}");
 
         Ok(Some(message))
     }
@@ -100,25 +116,32 @@ impl Encoder<Message> for MessageCodec {
                 dst.put_u32(0);
                 Ok(())
             }
-            Message::Choke => put_frame(dst, 0, &[]),
-            Message::Unchoke => put_frame(dst, 1, &[]),
-            Message::Interested => put_frame(dst, 2, &[]),
-            Message::NotInterested => put_frame(dst, 3, &[]),
-            Message::Have(index) => put_frame(dst, 4, &[&index.to_be_bytes()]),
-            Message::Bitfield(bits) => put_frame(dst, 5, &[&bits]),
-            Message::Request(request) => put_frame(dst, 6, &[request.to_bytes().as_flattened()]),
+            Message::Choke => put_frame(dst, id::CHOKE, &[]),
+            Message::Unchoke => put_frame(dst, id::UNCHOKE, &[]),
+            Message::Interested => put_frame(dst, id::INTERESTED, &[]),
+            Message::NotInterested => put_frame(dst, id::NOT_INTERESTED, &[]),
+            Message::Have(index) => put_frame(dst, id::HAVE, &[&index.get().to_be_bytes()]),
+            Message::Bitfield(bits) => put_frame(dst, id::BITFIELD, &[&bits]),
+            Message::Request(request) => {
+                put_frame(dst, id::REQUEST, &[request.to_bytes().as_flattened()])
+            }
             Message::Piece(piece) => put_frame(
                 dst,
-                7,
+                id::PIECE,
                 &[
-                    &piece.index.to_be_bytes(),
+                    &piece.index.get().to_be_bytes(),
                     &piece.begin.to_be_bytes(),
                     &piece.block,
                 ],
             ),
-            Message::Cancel(request) => put_frame(dst, 8, &[request.to_bytes().as_flattened()]),
-            Message::Port(port) => put_frame(dst, 9, &[&port.to_be_bytes()]),
-            Message::Extended { id, payload } => put_frame(dst, 20, &[&[id], &payload]),
+            Message::Cancel(request) => {
+                put_frame(dst, id::CANCEL, &[request.to_bytes().as_flattened()])
+            }
+            Message::Port(port) => put_frame(dst, id::PORT, &[&port.to_be_bytes()]),
+            Message::Extended {
+                id: extension,
+                payload,
+            } => put_frame(dst, id::EXTENDED, &[&[extension], &payload]),
         }
     }
 }
@@ -126,14 +149,14 @@ impl Encoder<Message> for MessageCodec {
 impl Request {
     fn decode(buf: &mut Bytes) -> Result<Self> {
         Ok(Self {
-            index: buf.try_get_u32()?,
+            index: buf.try_get_u32()?.into(),
             begin: buf.try_get_u32()?,
             length: buf.try_get_u32()?,
         })
     }
 
     fn to_bytes(self) -> [[u8; 4]; 3] {
-        [self.index, self.begin, self.length].map(u32::to_be_bytes)
+        [self.index.get(), self.begin, self.length].map(u32::to_be_bytes)
     }
 }
 
@@ -163,7 +186,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let request = Request {
-            index: 1,
+            index: 1.into(),
             begin: 16384,
             length: 16384,
         };
@@ -173,11 +196,11 @@ mod tests {
             Message::Unchoke,
             Message::Interested,
             Message::NotInterested,
-            Message::Have(42),
+            Message::Have(42.into()),
             Message::Bitfield(Bytes::from_static(&[0b1010_0000, 0xFF])),
             Message::Request(request),
             Message::Piece(Piece {
-                index: 3,
+                index: 3.into(),
                 begin: 0,
                 block: Bytes::from_static(b"block"),
             }),
@@ -206,12 +229,12 @@ mod tests {
         assert_eq!(&encode(Message::KeepAlive)[..], &[0, 0, 0, 0]);
         assert_eq!(&encode(Message::Interested)[..], &[0, 0, 0, 1, 2]);
         assert_eq!(
-            &encode(Message::Have(258))[..],
+            &encode(Message::Have(258.into()))[..],
             &[0, 0, 0, 5, 4, 0, 0, 1, 2]
         );
         assert_eq!(
             &encode(Message::Request(Request {
-                index: 1,
+                index: 1.into(),
                 begin: 2,
                 length: 3
             }))[..],
@@ -221,14 +244,14 @@ mod tests {
 
     #[test]
     fn decode_cases() {
-        let full = encode(Message::Have(7));
+        let full = encode(Message::Have(7.into()));
         let mut partial = BytesMut::from(&full[..6]);
         assert_eq!(MessageCodec.decode(&mut partial).unwrap(), None);
         assert_eq!(partial.len(), 6);
         partial.extend_from_slice(&full[6..]);
         assert_eq!(
             MessageCodec.decode(&mut partial).unwrap(),
-            Some(Message::Have(7))
+            Some(Message::Have(7.into()))
         );
 
         let mut short_prefix = BytesMut::from(&[0, 0][..]);

@@ -43,7 +43,7 @@ pub async fn spawn_seeder(
                 continue;
             }
 
-            let index = usize::try_from(request.index).unwrap();
+            let index = request.index.as_usize();
             let start = index * piece_length + usize::try_from(request.begin).unwrap();
             let end = start + usize::try_from(request.length).unwrap();
             frames

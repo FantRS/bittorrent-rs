@@ -1,4 +1,4 @@
-pub mod resume;
+mod resume;
 
 pub use resume::{FileStamp, ResumeData};
 
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::task::spawn_blocking;
 
-use crate::torrent::TorrentInfo;
+use crate::torrent::{PieceIndex, TorrentInfo};
 
 #[derive(Debug)]
 pub struct Storage {
@@ -99,14 +99,14 @@ impl Storage {
         spawn_blocking(move || files.sync()).await?
     }
 
-    pub async fn write_piece(&self, index: u32, data: Bytes) -> Result<()> {
+    pub async fn write_piece(&self, index: PieceIndex, data: Bytes) -> Result<()> {
         let offset = self.offset(index, 0)?;
         let files = Arc::clone(&self.files);
 
         spawn_blocking(move || files.write_at(offset, &data)).await?
     }
 
-    pub async fn read_block(&self, index: u32, begin: u32, length: u32) -> Result<Bytes> {
+    pub async fn read_block(&self, index: PieceIndex, begin: u32, length: u32) -> Result<Bytes> {
         let offset = self.offset(index, begin)?;
         let files = Arc::clone(&self.files);
 
@@ -115,12 +115,12 @@ impl Storage {
         Ok(Bytes::from(buf))
     }
 
-    pub fn read_piece_blocking(&self, index: u32, length: u32) -> Result<Vec<u8>> {
+    pub fn read_piece_blocking(&self, index: PieceIndex, length: u32) -> Result<Vec<u8>> {
         self.files.read_at(self.offset(index, 0)?, length)
     }
 
-    fn offset(&self, index: u32, begin: u32) -> Result<u64> {
-        u64::from(index)
+    fn offset(&self, index: PieceIndex, begin: u32) -> Result<u64> {
+        u64::from(index.get())
             .checked_mul(self.piece_length)
             .and_then(|start| start.checked_add(u64::from(begin)))
             .context("Block offset overflow")
@@ -217,21 +217,24 @@ mod tests {
         let storage = Storage::create(dir.path(), &info).await.unwrap();
         assert!(!storage.has_existing_data());
         storage
-            .write_piece(1, Bytes::from_static(b"ef"))
+            .write_piece(1.into(), Bytes::from_static(b"ef"))
             .await
             .unwrap();
         storage
-            .write_piece(0, Bytes::from_static(b"abcd"))
+            .write_piece(0.into(), Bytes::from_static(b"abcd"))
             .await
             .unwrap();
         assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), b"abcdef");
-        assert_eq!(&storage.read_block(1, 1, 1).await.unwrap()[..], b"f");
-        assert_eq!(&storage.read_block(0, 1, 4).await.unwrap()[..], b"bcde");
-        assert!(storage.read_block(1, 0, 4).await.is_err());
+        assert_eq!(&storage.read_block(1.into(), 1, 1).await.unwrap()[..], b"f");
+        assert_eq!(
+            &storage.read_block(0.into(), 1, 4).await.unwrap()[..],
+            b"bcde"
+        );
+        assert!(storage.read_block(1.into(), 0, 4).await.is_err());
 
         let reopened = Storage::create(dir.path(), &info).await.unwrap();
         assert!(reopened.has_existing_data());
-        assert_eq!(reopened.read_piece_blocking(1, 2).unwrap(), b"ef");
+        assert_eq!(reopened.read_piece_blocking(1.into(), 2).unwrap(), b"ef");
 
         let nested = dir.path().join("a/b");
         Storage::create(&nested, &info).await.unwrap();
@@ -262,11 +265,11 @@ mod tests {
 
         let storage = Storage::create(dir.path(), &info).await.unwrap();
         storage
-            .write_piece(0, Bytes::from_static(b"abcd"))
+            .write_piece(0.into(), Bytes::from_static(b"abcd"))
             .await
             .unwrap();
         storage
-            .write_piece(1, Bytes::from_static(b"e\0\0f"))
+            .write_piece(1.into(), Bytes::from_static(b"e\0\0f"))
             .await
             .unwrap();
         storage.sync().await.unwrap();
@@ -279,9 +282,18 @@ mod tests {
         assert_eq!(read("dir/empty"), b"");
         assert_eq!(read("dir/c"), b"f");
 
-        assert_eq!(&storage.read_block(0, 1, 3).await.unwrap()[..], b"bcd");
-        assert_eq!(&storage.read_block(1, 0, 4).await.unwrap()[..], b"e\0\0f");
-        assert_eq!(&storage.read_block(1, 2, 2).await.unwrap()[..], b"\0f");
-        assert!(storage.read_block(1, 3, 2).await.is_err());
+        assert_eq!(
+            &storage.read_block(0.into(), 1, 3).await.unwrap()[..],
+            b"bcd"
+        );
+        assert_eq!(
+            &storage.read_block(1.into(), 0, 4).await.unwrap()[..],
+            b"e\0\0f"
+        );
+        assert_eq!(
+            &storage.read_block(1.into(), 2, 2).await.unwrap()[..],
+            b"\0f"
+        );
+        assert!(storage.read_block(1.into(), 3, 2).await.is_err());
     }
 }

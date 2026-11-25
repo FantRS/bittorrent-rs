@@ -1,11 +1,10 @@
-pub mod client;
+mod client;
 
 pub use client::Client;
 
 use anyhow::{Context, Result, ensure};
 use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
-use futures_util::future::{join, join_all};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::convert::Infallible;
@@ -13,13 +12,14 @@ use std::future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 
-use crate::dht::Dht;
-use crate::peer::Request;
+use crate::cpu;
+use crate::discovery::Discovery;
+use crate::peer::{PeerId, Request};
 use crate::storage::{ResumeData, Storage};
-use crate::torrent::Torrent;
-use crate::tracker::{Announce, Event, announce_periodically};
+use crate::torrent::{PieceIndex, Torrent};
+use crate::tracker::{Announce, Event};
 
 const MAX_BLOCK_LEN: u32 = 1 << 17;
 const HAVE_BUFFER: usize = 64;
@@ -27,17 +27,17 @@ const HAVE_BUFFER: usize = 64;
 #[derive(Debug)]
 pub struct Session {
     pub torrent: Torrent,
-    pub peer_id: [u8; 20],
+    pub peer_id: PeerId,
     storage: Storage,
     have: RwLock<BitVec<u8, Msb0>>,
-    completed: broadcast::Sender<u32>,
+    completed: broadcast::Sender<PieceIndex>,
     uploaded: AtomicU64,
     downloaded: AtomicU64,
 }
 
 impl Session {
     #[must_use]
-    pub fn new(torrent: Torrent, peer_id: [u8; 20], storage: Storage) -> Self {
+    pub fn new(torrent: Torrent, peer_id: PeerId, storage: Storage) -> Self {
         let piece_count = torrent.meta.info.piece_count();
 
         Self {
@@ -64,12 +64,7 @@ impl Session {
         }
 
         let session = Arc::clone(self);
-        let (sender, receiver) = oneshot::channel();
-        rayon::spawn(move || {
-            let _ = sender.send(session.verify_existing());
-        });
-
-        Ok(receiver.await?)
+        cpu::spawn(move || session.verify_existing()).await
     }
 
     pub async fn resume_data(&self) -> Result<ResumeData> {
@@ -97,7 +92,7 @@ impl Session {
         let valid: Vec<usize> = (0..info.piece_count())
             .into_par_iter()
             .filter_map(|slot| {
-                let index = u32::try_from(slot).ok()?;
+                let index = PieceIndex::try_from(slot).ok()?;
                 let length = info.piece_len(index)?;
                 let piece = self.storage.read_piece_blocking(index, length).ok()?;
                 info.verify(index, &piece).then_some(slot)
@@ -133,7 +128,7 @@ impl Session {
     }
 
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<u32> {
+    pub fn subscribe(&self) -> broadcast::Receiver<PieceIndex> {
         self.completed.subscribe()
     }
 
@@ -154,22 +149,12 @@ impl Session {
         &self,
         port: u16,
         peers: mpsc::Sender<Vec<SocketAddr>>,
-        dht: Option<&Dht>,
+        discovery: &Discovery,
     ) -> Infallible {
         let request = |event| self.announce(port, event);
-        let trackers = self.torrent.meta.trackers.iter();
-        let dht = async {
-            if let Some(dht) = dht {
-                dht.announce_periodically(self.torrent.info_hash, port, &peers)
-                    .await;
-            }
-        };
-
-        join(
-            join_all(trackers.map(|tracker| announce_periodically(tracker, request, &peers))),
-            dht,
-        )
-        .await;
+        discovery
+            .discover(&self.torrent.meta.trackers, request, &peers)
+            .await;
         future::pending().await
     }
 
@@ -179,7 +164,7 @@ impl Session {
             .read()
             .iter_zeros()
             .filter_map(|slot| {
-                u32::try_from(slot)
+                PieceIndex::try_from(slot)
                     .ok()
                     .and_then(|index| info.piece_len(index))
             })
@@ -187,15 +172,14 @@ impl Session {
             .sum()
     }
 
-    pub async fn store_piece(&self, index: u32, piece: Bytes) -> Result<()> {
+    pub async fn store_piece(&self, index: PieceIndex, piece: Bytes) -> Result<()> {
         let len = u64::try_from(piece.len())?;
         self.storage.write_piece(index, piece).await?;
 
-        let slot = usize::try_from(index)?;
         *self
             .have
             .write()
-            .get_mut(slot)
+            .get_mut(index.as_usize())
             .with_context(|| format!("Invalid piece index: {index}"))? = true;
         self.downloaded.fetch_add(len, Ordering::Relaxed);
         let _ = self.completed.send(index);
@@ -217,7 +201,7 @@ impl Session {
         ensure!(
             self.have
                 .read()
-                .get(usize::try_from(index)?)
+                .get(index.as_usize())
                 .is_some_and(|bit| *bit),
             "Requested missing piece {index}"
         );

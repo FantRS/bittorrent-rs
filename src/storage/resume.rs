@@ -5,9 +5,11 @@ use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
+use crate::torrent::InfoHash;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeData {
-    pub info_hash: [u8; 20],
+    pub info_hash: InfoHash,
     pub have: Vec<u8>,
     pub files: Vec<FileStamp>,
 }

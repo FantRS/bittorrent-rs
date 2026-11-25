@@ -13,7 +13,13 @@ pub struct Swarm<T> {
     tasks: JoinSet<Result<T>>,
     active: HashMap<task::Id, SocketAddr>,
     queued: VecDeque<SocketAddr>,
-    known: HashMap<SocketAddr, Option<Instant>>,
+    known: HashMap<SocketAddr, Contact>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Contact {
+    Pending,
+    Left(Instant),
 }
 
 impl<T: Send + 'static> Swarm<T> {
@@ -30,12 +36,12 @@ impl<T: Send + 'static> Swarm<T> {
     pub fn enqueue(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) {
         for addr in addrs {
             let busy = match self.known.get(&addr) {
-                Some(None) => true,
-                Some(Some(left)) => left.elapsed() < RETRY_DELAY,
+                Some(Contact::Pending) => true,
+                Some(Contact::Left(at)) => at.elapsed() < RETRY_DELAY,
                 None => false,
             };
             if !busy {
-                self.known.insert(addr, None);
+                self.known.insert(addr, Contact::Pending);
                 self.queued.push_back(addr);
             }
         }
@@ -59,7 +65,7 @@ impl<T: Send + 'static> Swarm<T> {
             Err(e) => (e.id(), Err(e.into())),
         };
         if let Some(addr) = self.active.remove(&id) {
-            self.known.insert(addr, Some(Instant::now()));
+            self.known.insert(addr, Contact::Left(Instant::now()));
         }
 
         Some(result)

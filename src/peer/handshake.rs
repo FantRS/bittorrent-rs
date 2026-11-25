@@ -2,6 +2,9 @@ use anyhow::{Result, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
+use crate::peer::PeerId;
+use crate::torrent::InfoHash;
+
 const PSTRLEN: u8 = 19;
 const PROTOCOL: &[u8; PSTRLEN as usize] = b"BitTorrent protocol";
 const EXTENSION_BYTE: usize = 5;
@@ -13,13 +16,13 @@ pub struct Handshake {
     pstrlen: u8,
     pstr: [u8; PSTRLEN as usize],
     pub reserved: [u8; 8],
-    pub info_hash: [u8; 20],
-    pub peer_id: [u8; 20],
+    pub info_hash: InfoHash,
+    pub peer_id: PeerId,
 }
 
 impl Handshake {
     #[must_use]
-    pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+    pub fn new(info_hash: InfoHash, peer_id: PeerId) -> Self {
         Self {
             pstrlen: PSTRLEN,
             pstr: *PROTOCOL,
@@ -70,7 +73,9 @@ mod tests {
     fn wire_layout() {
         let info_hash = [0xAA; 20];
         let peer_id = *b"-RS0001-123456789012";
-        let bytes = Handshake::new(info_hash, peer_id).as_bytes().to_vec();
+        let bytes = Handshake::new(info_hash.into(), peer_id.into())
+            .as_bytes()
+            .to_vec();
 
         assert_eq!(bytes.len(), 68);
         assert_eq!(bytes[0], 19);
@@ -89,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_cases() {
-        let mut theirs = Handshake::new([1; 20], [3; 20]);
+        let mut theirs = Handshake::new([1; 20].into(), [3; 20].into());
         assert!(theirs.supports_extensions());
         theirs.reserved = [0; 8];
         assert!(!theirs.supports_extensions());

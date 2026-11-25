@@ -1,9 +1,9 @@
+use anyhow::{Result, anyhow, ensure};
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow};
-use sha1::{Digest, Sha1};
-
 use crate::bencode::BencodeValue;
+
+const MAX_DEPTH: usize = 64;
 
 pub struct BencodeParser {
     bytes: Vec<u8>,
@@ -34,16 +34,11 @@ impl BencodeParser {
     }
 
     #[must_use]
-    pub fn info_hash(&self) -> Option<[u8; 20]> {
+    pub fn info_bytes(&self) -> Option<&[u8]> {
         let (start, end) = self.info_span?;
-
-        let info_bytes = self.bytes.get(start..end)?;
-        let digest = Sha1::digest(info_bytes);
-
-        Some(digest.into())
+        self.bytes.get(start..end)
     }
 
-    /// ЧИСЛО: `i<var>e`
     fn parse_int(&mut self) -> Result<BencodeValue> {
         self.cursor += 1;
         let raw = self.read_until(b'e')?;
@@ -52,7 +47,6 @@ impl BencodeParser {
         Ok(BencodeValue::Int(var))
     }
 
-    /// СТРОКА БАЙТ: `<len>:<var>`
     fn parse_bytes(&mut self) -> Result<BencodeValue> {
         let raw = self.read_until(b':')?;
         let len: usize = String::from_utf8(raw)?.parse()?;
@@ -67,7 +61,6 @@ impl BencodeParser {
         Ok(BencodeValue::Bytes(var))
     }
 
-    /// СПИСОК: `l<var>e`
     fn parse_list(&mut self) -> Result<BencodeValue> {
         let mut var = Vec::new();
 
@@ -80,7 +73,6 @@ impl BencodeParser {
         Ok(BencodeValue::List(var))
     }
 
-    /// СЛОВНИК: `d<var>e`
     fn parse_dict(&mut self) -> Result<BencodeValue> {
         let mut var = BTreeMap::new();
 
@@ -141,33 +133,36 @@ impl BencodeParser {
     fn parse_delimited(
         &mut self,
         open: u8,
-        mut on_item: impl FnMut(&mut Self, u8) -> Result<()>,
+        on_item: impl FnMut(&mut Self, u8) -> Result<()>,
     ) -> Result<()> {
-        let mut is_start = true;
-        let mut is_end = false;
+        ensure!(
+            self.bytes.get(self.cursor) == Some(&open),
+            "Expected '{}'",
+            open as char
+        );
+        ensure!(
+            self.depth < MAX_DEPTH,
+            "Nesting deeper than {MAX_DEPTH} levels"
+        );
 
+        self.cursor += 1;
+        self.depth += 1;
+        let items = self.parse_items(on_item);
+        self.depth -= 1;
+
+        items
+    }
+
+    fn parse_items(&mut self, mut on_item: impl FnMut(&mut Self, u8) -> Result<()>) -> Result<()> {
         while let Some(&byte) = self.bytes.get(self.cursor) {
-            match byte {
-                b if b == open && is_start => {
-                    self.cursor += 1;
-                    self.depth += 1;
-                    is_start = false;
-                }
-                b'e' => {
-                    self.cursor += 1;
-                    self.depth -= 1;
-                    is_end = true;
-                    break;
-                }
-                _ => on_item(self, byte)?,
+            if byte == b'e' {
+                self.cursor += 1;
+                return Ok(());
             }
+            on_item(self, byte)?;
         }
 
-        if !is_end {
-            return Err(anyhow!("Value not terminated with 'e'"));
-        }
-
-        Ok(())
+        Err(anyhow!("Value not terminated with 'e'"))
     }
 }
 
@@ -177,27 +172,22 @@ mod tests {
 
     #[test]
     fn parse_int_cases() {
-        // число 42
         let mut p = BencodeParser::new(b"i42e".to_vec());
         assert_eq!(p.parse_int().unwrap(), BencodeValue::Int(42));
         assert_eq!(p.cursor, 4);
 
-        // число 0
         let mut p = BencodeParser::new(b"i0e".to_vec());
         assert_eq!(p.parse_int().unwrap(), BencodeValue::Int(0));
 
-        // число -21
         let mut p = BencodeParser::new(b"i-21e".to_vec());
         assert_eq!(p.parse_int().unwrap(), BencodeValue::Int(-21));
 
-        // помилка: немає закриваючого 'e'
         let mut p = BencodeParser::new(b"i42".to_vec());
         assert!(p.parse_int().is_err());
     }
 
     #[test]
     fn parse_bytes_cases() {
-        // звичайний рядок
         let mut p = BencodeParser::new(b"4:spam".to_vec());
         assert_eq!(
             p.parse_bytes().unwrap(),
@@ -205,45 +195,50 @@ mod tests {
         );
         assert_eq!(p.cursor, 6);
 
-        // порожній рядок
         let mut p = BencodeParser::new(b"0:".to_vec());
         assert_eq!(p.parse_bytes().unwrap(), BencodeValue::Bytes(Vec::new()));
         assert_eq!(p.cursor, 2);
 
-        // довжина з кількох цифр
         let mut p = BencodeParser::new(b"10:0123456789".to_vec());
         assert_eq!(
             p.parse_bytes().unwrap(),
             BencodeValue::Bytes(b"0123456789".to_vec())
         );
 
-        // бінарні (не-UTF8) байти
         let mut p = BencodeParser::new(vec![b'4', b':', 0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(
             p.parse_bytes().unwrap(),
             BencodeValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef])
         );
 
-        // помилка: немає роздільника ':'
         let mut p = BencodeParser::new(b"4spam".to_vec());
         assert!(p.parse_bytes().is_err());
 
-        // помилка: заявлена довжина більша, ніж лишилось байтів
         let mut p = BencodeParser::new(b"10:spam".to_vec());
         assert!(p.parse_bytes().is_err());
 
-        // помилка: довжина не число
         let mut p = BencodeParser::new(b"a:spam".to_vec());
         assert!(p.parse_bytes().is_err());
     }
 
     #[test]
     fn parse_list_cases() {
-        // порожній список
         let mut p = BencodeParser::new(b"le".to_vec());
         assert_eq!(p.parse_list().unwrap(), BencodeValue::List(vec![]));
 
-        // список зі змішаними типами
+        let nested = |depth| [b"l".repeat(depth), b"e".repeat(depth)].concat();
+        assert!(BencodeParser::new(nested(MAX_DEPTH)).parse_list().is_ok());
+        assert!(
+            BencodeParser::new(nested(MAX_DEPTH + 1))
+                .parse_list()
+                .is_err()
+        );
+        assert!(BencodeParser::new(nested(1 << 20)).parse_list().is_err());
+
+        let mut p = BencodeParser::new(b"ll1:ae".to_vec());
+        assert!(p.parse_list().is_err());
+        assert_eq!(p.depth, 0);
+
         let mut p = BencodeParser::new(b"l4:spami42ee".to_vec());
         assert_eq!(
             p.parse_list().unwrap(),
@@ -253,7 +248,6 @@ mod tests {
             ])
         );
 
-        // вкладений список
         let mut p = BencodeParser::new(b"ll4:spamee".to_vec());
         assert_eq!(
             p.parse_list().unwrap(),
@@ -262,7 +256,6 @@ mod tests {
             )])])
         );
 
-        // список списків з числами
         let mut p = BencodeParser::new(b"lli1ei2eeli3ei4eee".to_vec());
         assert_eq!(
             p.parse_list().unwrap(),
@@ -272,38 +265,31 @@ mod tests {
             ])
         );
 
-        // курсор просунувся рівно до кінця вхідних байтів
         let mut p = BencodeParser::new(b"l4:spame".to_vec());
         p.parse_list().unwrap();
         assert_eq!(p.cursor, 8);
 
-        // помилка: список без завершального 'e'
         let mut p = BencodeParser::new(b"l4:spam".to_vec());
         assert!(p.parse_list().is_err());
 
-        // помилка: обірваний елемент всередині списку
         let mut p = BencodeParser::new(b"l4:sp".to_vec());
         assert!(p.parse_list().is_err());
 
-        // помилка: невідомий тип елемента
         let mut p = BencodeParser::new(b"lxe".to_vec());
         assert!(p.parse_list().is_err());
     }
 
     #[test]
     fn parse_dict_cases() {
-        // порожній словник
         let mut p = BencodeParser::new(b"de".to_vec());
         assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(BTreeMap::new()));
 
-        // простий словник з двома різнотипними значеннями
         let mut p = BencodeParser::new(b"d3:bar4:spam3:fooi42ee".to_vec());
         let mut expected = BTreeMap::new();
         expected.insert(b"bar".to_vec(), BencodeValue::Bytes(b"spam".to_vec()));
         expected.insert(b"foo".to_vec(), BencodeValue::Int(42));
         assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
 
-        // вкладений словник як значення
         let mut p = BencodeParser::new(b"d3:food3:bar3:bazee".to_vec());
         let mut inner = BTreeMap::new();
         inner.insert(b"bar".to_vec(), BencodeValue::Bytes(b"baz".to_vec()));
@@ -311,7 +297,6 @@ mod tests {
         expected.insert(b"foo".to_vec(), BencodeValue::Dict(inner));
         assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
 
-        // список як значення (наближено до реального .torrent, поле "files")
         let mut p = BencodeParser::new(b"d5:filesli1ei2eee".to_vec());
         let mut expected = BTreeMap::new();
         expected.insert(
@@ -320,15 +305,12 @@ mod tests {
         );
         assert_eq!(p.parse_dict().unwrap(), BencodeValue::Dict(expected));
 
-        // помилка: ключ не byte string
         let mut p = BencodeParser::new(b"di42e4:spame".to_vec());
         assert!(p.parse_dict().is_err());
 
-        // помилка: значення відсутнє (обірвано одразу після ключа)
         let mut p = BencodeParser::new(b"d3:fooe".to_vec());
         assert!(p.parse_dict().is_err());
 
-        // помилка: словник без завершального 'e'
         let mut p = BencodeParser::new(b"d3:foo3:bar".to_vec());
         assert!(p.parse_dict().is_err());
 
@@ -337,14 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn info_hash_cases() {
+    fn info_bytes_cases() {
         let mut p = BencodeParser::new(b"d4:infod4:infoi1e1:ai2ee7:x-extrad4:infoi3eee".to_vec());
         p.parse().unwrap();
-        let expected: [u8; 20] = Sha1::digest(b"d4:infoi1e1:ai2ee").into();
-        assert_eq!(p.info_hash(), Some(expected));
+        assert_eq!(p.info_bytes(), Some(&b"d4:infoi1e1:ai2ee"[..]));
 
         let mut p = BencodeParser::new(b"d3:fooi1ee".to_vec());
         p.parse().unwrap();
-        assert_eq!(p.info_hash(), None);
+        assert_eq!(p.info_bytes(), None);
     }
 }
