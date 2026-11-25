@@ -1,11 +1,7 @@
-pub mod args_parser;
 pub mod bencode;
-pub mod client;
-pub mod download;
 pub mod peer;
-pub mod resume;
 pub mod session;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;
-pub mod upload;
+pub mod transfer;

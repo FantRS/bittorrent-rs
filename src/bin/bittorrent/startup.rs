@@ -7,17 +7,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use bittorrent_rs::args_parser::Args;
-use bittorrent_rs::client::Client;
-use bittorrent_rs::download::download;
-use bittorrent_rs::resume::ResumeData;
-use bittorrent_rs::session::Session;
-use bittorrent_rs::storage::Storage;
+use bittorrent_rs::session::{Client, Session};
+use bittorrent_rs::storage::{ResumeData, Storage};
 use bittorrent_rs::torrent::Torrent;
 use bittorrent_rs::tracker::{Event, announce_all};
-use bittorrent_rs::upload::seed;
+use bittorrent_rs::transfer::{download, seed};
 
-const PEER_QUEUE: usize = 256;
+use crate::args::Args;
+
+const PEER_QUEUE: usize = 64;
 
 pub async fn start() -> Result<()> {
     tracing_subscriber::fmt()
@@ -69,9 +67,9 @@ async fn run(session: &Arc<Session>, client: &Client, port: u16) -> Result<()> {
         )?);
 
     let (peers_sender, peers) = mpsc::channel(PEER_QUEUE);
-    let announcing = session.run_announcer(port, peers_sender);
+    let announcing = session.run_announcer(port, peers_sender.clone());
     let downloading = download(Arc::clone(session), peers, |len| progress.inc(len));
-    let seeding = seed(Arc::clone(session), &client.lst);
+    let seeding = seed(Arc::clone(session), &client.lst, peers_sender);
     tokio::pin!(announcing, seeding);
 
     tokio::select! {

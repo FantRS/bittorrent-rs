@@ -7,7 +7,7 @@ use url::{Host, Url};
 use zerocopy::network_endian::{I32, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::tracker::response::parse_compact_peers;
+use crate::peer::compact::parse_compact_peers;
 use crate::tracker::{Announce, Event, TrackerResponse};
 
 const PROTOCOL_ID: u64 = 0x0417_2710_1980;

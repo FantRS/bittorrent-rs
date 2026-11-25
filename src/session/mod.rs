@@ -1,3 +1,7 @@
+pub mod client;
+
+pub use client::Client;
+
 use anyhow::{Context, Result, ensure};
 use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
@@ -10,8 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::peer::Request;
-use crate::resume::ResumeData;
-use crate::storage::Storage;
+use crate::storage::{ResumeData, Storage};
 use crate::torrent::Torrent;
 use crate::tracker::{Announce, Event, announce_periodically};
 
@@ -144,7 +147,7 @@ impl Session {
         }
     }
 
-    pub async fn run_announcer(&self, port: u16, peers: mpsc::Sender<SocketAddr>) {
+    pub async fn run_announcer(&self, port: u16, peers: mpsc::Sender<Vec<SocketAddr>>) {
         let request = |event| self.announce(port, event);
         let trackers = self.torrent.meta.trackers.iter();
 

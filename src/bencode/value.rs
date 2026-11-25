@@ -11,6 +11,42 @@ pub enum BencodeValue {
     Dict(Dict),
 }
 
+impl BencodeValue {
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    fn encode_into(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::Int(value) => buf.extend_from_slice(format!("i{value}e").as_bytes()),
+            Self::Bytes(bytes) => encode_bytes(bytes, buf),
+            Self::List(list) => {
+                buf.push(b'l');
+                for item in list {
+                    item.encode_into(buf);
+                }
+                buf.push(b'e');
+            }
+            Self::Dict(dict) => {
+                buf.push(b'd');
+                for (key, value) in dict {
+                    encode_bytes(key, buf);
+                    value.encode_into(buf);
+                }
+                buf.push(b'e');
+            }
+        }
+    }
+}
+
+fn encode_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(format!("{}:", bytes.len()).as_bytes());
+    buf.extend_from_slice(bytes);
+}
+
 pub trait DictExt {
     fn take<T>(&mut self, key: &str) -> Result<T>
     where
@@ -97,5 +133,29 @@ impl TryFrom<BencodeValue> for String {
             }
             _ => Err(anyhow!("Expected a byte string, got {value:?}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bencode::BencodeParser;
+
+    #[test]
+    fn encode_cases() {
+        let value = BencodeValue::Dict(Dict::from([
+            (b"b".to_vec(), BencodeValue::Int(-3)),
+            (
+                b"a".to_vec(),
+                BencodeValue::List(vec![
+                    BencodeValue::Bytes(b"spam".to_vec()),
+                    BencodeValue::Bytes(Vec::new()),
+                ]),
+            ),
+        ]));
+
+        let encoded = value.encode();
+        assert_eq!(encoded, b"d1:al4:spam0:e1:bi-3ee");
+        assert_eq!(BencodeParser::new(encoded).parse().unwrap(), value);
     }
 }

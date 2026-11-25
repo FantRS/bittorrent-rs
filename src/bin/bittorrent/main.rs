@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+mod args;
 mod startup;
 
 #[tokio::main]

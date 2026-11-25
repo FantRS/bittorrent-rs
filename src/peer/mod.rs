@@ -1,4 +1,6 @@
+pub(crate) mod compact;
 pub mod connection;
+mod extension;
 pub mod handshake;
 pub mod message;
 #[cfg(test)]

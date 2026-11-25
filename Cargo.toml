@@ -6,7 +6,7 @@ autobins = false
 
 [[bin]]
 name = "bittorrent"
-path = "src/bin/main.rs"
+path = "src/bin/bittorrent/main.rs"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -48,4 +48,5 @@ socket2 = "0.6.5"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
 

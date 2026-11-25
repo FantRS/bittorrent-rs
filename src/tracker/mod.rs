@@ -61,7 +61,7 @@ pub async fn announce_all(trackers: &[String], request: Announce) {
 pub async fn announce_periodically(
     tracker: &str,
     request: impl Fn(Option<Event>) -> Announce,
-    peers: &mpsc::Sender<SocketAddr>,
+    peers: &mpsc::Sender<Vec<SocketAddr>>,
 ) {
     let mut event = Some(Event::Started);
 
@@ -74,9 +74,7 @@ pub async fn announce_periodically(
                     response.peers.len(),
                     interval.as_secs()
                 );
-                for peer in response.peers {
-                    let _ = peers.try_send(peer);
-                }
+                let _ = peers.send(response.peers).await;
                 event = None;
                 interval
             }

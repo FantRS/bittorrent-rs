@@ -31,6 +31,7 @@ pub enum Message {
     Request(Request),
     Piece(Piece),
     Cancel(Request),
+    Extended { id: u8, payload: Bytes },
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +76,10 @@ impl Decoder for MessageCodec {
                 block: mem::take(&mut payload),
             }),
             8 => Message::Cancel(Request::decode(&mut payload)?),
+            20 => Message::Extended {
+                id: payload.try_get_u8()?,
+                payload: mem::take(&mut payload),
+            },
             _ => bail!("Unknown message id: {id}"),
         };
 
@@ -110,6 +115,7 @@ impl Encoder<Message> for MessageCodec {
                 ],
             ),
             Message::Cancel(request) => put_frame(dst, 8, &[request.to_bytes().as_flattened()]),
+            Message::Extended { id, payload } => put_frame(dst, 20, &[&[id], &payload]),
         }
     }
 }
@@ -173,6 +179,10 @@ mod tests {
                 block: Bytes::from_static(b"block"),
             }),
             Message::Cancel(request),
+            Message::Extended {
+                id: 1,
+                payload: Bytes::from_static(b"d5:addede"),
+            },
         ];
 
         let mut stream = BytesMut::new();
@@ -228,6 +238,9 @@ mod tests {
 
         let mut short_have = BytesMut::from(&[0, 0, 0, 3, 4, 0, 0][..]);
         assert!(MessageCodec.decode(&mut short_have).is_err());
+
+        let mut empty_extended = BytesMut::from(&[0, 0, 0, 1, 20][..]);
+        assert!(MessageCodec.decode(&mut empty_extended).is_err());
 
         let mut long_choke = BytesMut::from(&[0, 0, 0, 2, 0, 0][..]);
         assert!(MessageCodec.decode(&mut long_choke).is_err());

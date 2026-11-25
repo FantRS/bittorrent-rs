@@ -1,8 +1,9 @@
 use anyhow::Result;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, info, warn};
@@ -14,7 +15,11 @@ const UPLOAD_SLOTS: usize = 4;
 const SLOT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 
-pub async fn seed(session: Arc<Session>, listener: &TcpListener) -> Result<()> {
+pub async fn seed(
+    session: Arc<Session>,
+    listener: &TcpListener,
+    discovered: mpsc::Sender<Vec<SocketAddr>>,
+) -> Result<()> {
     let slots = Arc::new(Semaphore::new(UPLOAD_SLOTS));
     let mut peers = JoinSet::new();
 
@@ -22,7 +27,8 @@ pub async fn seed(session: Arc<Session>, listener: &TcpListener) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    peers.spawn(serve(stream, Arc::clone(&session), Arc::clone(&slots)));
+                    let peer = serve(stream, Arc::clone(&session), Arc::clone(&slots), discovered.clone());
+                    peers.spawn(peer);
                 }
                 Err(e) => {
                     warn!("Failed to accept connection: {e}");
@@ -38,14 +44,19 @@ pub async fn seed(session: Arc<Session>, listener: &TcpListener) -> Result<()> {
     }
 }
 
-async fn serve(stream: TcpStream, session: Arc<Session>, slots: Arc<Semaphore>) -> Result<()> {
+async fn serve(
+    stream: TcpStream,
+    session: Arc<Session>,
+    slots: Arc<Semaphore>,
+    discovered: mpsc::Sender<Vec<SocketAddr>>,
+) -> Result<()> {
     let info_hash = session.torrent.info_hash;
     let piece_count = session.torrent.meta.info.piece_count();
     let mut conn = PeerConnection::accept(stream, info_hash, session.peer_id, piece_count).await?;
     info!(
         "{}: incoming peer ({})",
         conn.addr,
-        String::from_utf8_lossy(&conn.peer_id)
+        String::from_utf8_lossy(&conn.peer_id())
     );
 
     let mut completed = session.subscribe();
@@ -53,6 +64,7 @@ async fn serve(stream: TcpStream, session: Arc<Session>, slots: Arc<Semaphore>) 
     let mut acquire = Box::pin(Arc::clone(&slots).acquire_owned());
     let mut idle_deadline = Instant::now();
     conn.send(Message::Bitfield(session.bitfield())).await?;
+    conn.enable_extensions(discovered).await?;
 
     loop {
         tokio::select! {

@@ -6,9 +6,12 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::codec::Framed;
+use tracing::debug;
 
+use crate::peer::extension;
 use crate::peer::{Handshake, Message, MessageCodec, Request};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -19,12 +22,13 @@ const STALL_TIMEOUT: Duration = Duration::from_mins(1);
 #[derive(Debug)]
 pub struct PeerConnection {
     pub addr: SocketAddr,
-    pub peer_id: [u8; 20],
+    handshake: Handshake,
     frames: Framed<TcpStream, MessageCodec>,
     am_interested: bool,
     peer_choking: bool,
     peer_interested: bool,
     pieces: BitVec<u8, Msb0>,
+    exchanged: Option<mpsc::Sender<Vec<SocketAddr>>>,
 }
 
 impl PeerConnection {
@@ -45,7 +49,7 @@ impl PeerConnection {
             ensure!(reply.info_hash == info_hash, "info_hash mismatch");
             ensure!(reply.peer_id != peer_id, "Connected to ourselves");
 
-            Ok(Self::new(addr, reply.peer_id, stream, piece_count))
+            Ok(Self::new(addr, reply, stream, piece_count))
         })
         .await
     }
@@ -66,21 +70,43 @@ impl PeerConnection {
                 .write_to(&mut stream)
                 .await?;
 
-            Ok(Self::new(addr, theirs.peer_id, stream, piece_count))
+            Ok(Self::new(addr, theirs, stream, piece_count))
         })
         .await
     }
 
-    fn new(addr: SocketAddr, peer_id: [u8; 20], stream: TcpStream, piece_count: usize) -> Self {
+    fn new(addr: SocketAddr, handshake: Handshake, stream: TcpStream, piece_count: usize) -> Self {
         Self {
             addr,
-            peer_id,
+            handshake,
             frames: Framed::new(stream, MessageCodec),
             am_interested: false,
             peer_choking: true,
             peer_interested: false,
             pieces: BitVec::repeat(false, piece_count),
+            exchanged: None,
         }
+    }
+
+    #[must_use]
+    pub fn peer_id(&self) -> [u8; 20] {
+        self.handshake.peer_id
+    }
+
+    pub async fn enable_extensions(
+        &mut self,
+        exchanged: mpsc::Sender<Vec<SocketAddr>>,
+    ) -> Result<()> {
+        if self.handshake.supports_extensions() {
+            self.send(Message::Extended {
+                id: extension::HANDSHAKE,
+                payload: extension::handshake(),
+            })
+            .await?;
+            self.exchanged = Some(exchanged);
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -144,6 +170,22 @@ impl PeerConnection {
                 );
                 self.pieces = BitVec::from_slice(bits);
                 self.pieces.truncate(piece_count);
+            }
+            Message::Extended {
+                id: extension::UT_PEX,
+                payload,
+            } => {
+                if let Some(exchanged) = &self.exchanged {
+                    match extension::parse_pex(payload) {
+                        Ok(peers) => {
+                            debug!("{}: {} peers via PEX", self.addr, peers.len());
+                            if !peers.is_empty() {
+                                let _ = exchanged.send(peers).await;
+                            }
+                        }
+                        Err(e) => debug!("{}: invalid PEX message: {e:#}", self.addr),
+                    }
+                }
             }
             _ => {}
         }
@@ -224,6 +266,7 @@ async fn with_timeout(
 mod tests {
     use super::*;
     use crate::peer::testing::spawn_seeder;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn connect_cases() {
@@ -237,7 +280,7 @@ mod tests {
         let addr = spawn_seeder(seeder(info_hash), &[0b0100_0000], data.clone(), 40_000).await;
         let mut conn = connect(addr).await.unwrap();
         assert_eq!(conn.addr, addr);
-        assert_eq!(conn.peer_id, their_id);
+        assert_eq!(conn.peer_id(), their_id);
         assert!(conn.is_choked());
 
         while conn.is_choked() {
@@ -266,5 +309,56 @@ mod tests {
 
         let addr = spawn_seeder(None, &[0], Bytes::new(), 0).await;
         assert!(connect(addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_cases() {
+        let info_hash = [7; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let remote = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let ours = Handshake::read_from(&mut stream).await.unwrap();
+            Handshake::new(info_hash, [1; 20])
+                .write_to(&mut stream)
+                .await
+                .unwrap();
+
+            let mut frames = Framed::new(stream, MessageCodec);
+            let handshake = frames.next().await.unwrap().unwrap();
+            frames
+                .send(Message::Extended {
+                    id: extension::UT_PEX,
+                    payload: Bytes::from_static(b"d5:added6:\x01\x02\x03\x04\x00\x05e"),
+                })
+                .await
+                .unwrap();
+            frames.send(Message::Unchoke).await.unwrap();
+
+            (ours.supports_extensions(), handshake)
+        });
+
+        let mut conn = PeerConnection::connect(addr, info_hash, [2; 20], 1)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        conn.enable_extensions(sender).await.unwrap();
+        while conn.is_choked() {
+            conn.recv().await.unwrap();
+        }
+
+        assert_eq!(receiver.try_recv().unwrap(), ["1.2.3.4:5".parse().unwrap()]);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            remote.await.unwrap(),
+            (
+                true,
+                Message::Extended {
+                    id: extension::HANDSHAKE,
+                    payload: extension::handshake()
+                }
+            )
+        );
     }
 }

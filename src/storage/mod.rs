@@ -1,3 +1,7 @@
+pub mod resume;
+
+pub use resume::{FileStamp, ResumeData};
+
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use std::fs::File;
@@ -8,7 +12,6 @@ use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::task::spawn_blocking;
 
-use crate::resume::FileStamp;
 use crate::torrent::TorrentInfo;
 
 #[derive(Debug)]

@@ -1,10 +1,9 @@
-use anyhow::{Context, Result, anyhow, bail};
-use std::net::{IpAddr, SocketAddr};
+use anyhow::{Context, Result, bail};
+use std::net::SocketAddr;
 use tracing::warn;
-use zerocopy::network_endian::U16;
-use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 use crate::bencode::{BencodeValue, Dict, DictExt};
+use crate::peer::compact::parse_compact_peers;
 
 #[derive(Debug)]
 pub struct TrackerResponse {
@@ -49,27 +48,6 @@ impl TryFrom<BencodeValue> for TrackerResponse {
             incomplete: dict.take_opt("incomplete"),
         })
     }
-}
-
-#[derive(FromBytes, KnownLayout, Immutable)]
-#[repr(C)]
-struct CompactPeer<Ip> {
-    ip: Ip,
-    port: U16,
-}
-
-pub(crate) fn parse_compact_peers<Ip>(bytes: &[u8]) -> Result<Vec<SocketAddr>>
-where
-    Ip: FromBytes + KnownLayout + Immutable + Copy,
-    IpAddr: From<Ip>,
-{
-    let peers = <[CompactPeer<Ip>]>::ref_from_bytes(bytes)
-        .map_err(|_| anyhow!("Invalid compact peers length: {}", bytes.len()))?;
-
-    Ok(peers
-        .iter()
-        .map(|peer| SocketAddr::new(peer.ip.into(), peer.port.get()))
-        .collect())
 }
 
 fn parse_peer(value: BencodeValue) -> Option<SocketAddr> {

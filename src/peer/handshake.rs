@@ -4,6 +4,8 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 const PSTRLEN: u8 = 19;
 const PROTOCOL: &[u8; PSTRLEN as usize] = b"BitTorrent protocol";
+const EXTENSION_BYTE: usize = 5;
+const EXTENSION_BIT: u8 = 0x10;
 
 #[derive(Debug, Clone, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
@@ -21,10 +23,17 @@ impl Handshake {
         Self {
             pstrlen: PSTRLEN,
             pstr: *PROTOCOL,
-            reserved: [0; 8],
+            reserved: [0, 0, 0, 0, 0, EXTENSION_BIT, 0, 0],
             info_hash,
             peer_id,
         }
+    }
+
+    #[must_use]
+    pub fn supports_extensions(&self) -> bool {
+        self.reserved
+            .get(EXTENSION_BYTE)
+            .is_some_and(|byte| byte & EXTENSION_BIT != 0)
     }
 
     pub async fn write_to<S>(&self, stream: &mut S) -> Result<()>
@@ -66,7 +75,7 @@ mod tests {
         assert_eq!(bytes.len(), 68);
         assert_eq!(bytes[0], 19);
         assert_eq!(&bytes[1..20], PROTOCOL);
-        assert_eq!(&bytes[20..28], &[0; 8]);
+        assert_eq!(&bytes[20..28], &[0, 0, 0, 0, 0, 0x10, 0, 0]);
         assert_eq!(&bytes[28..48], &info_hash);
         assert_eq!(&bytes[48..68], &peer_id);
     }
@@ -81,7 +90,9 @@ mod tests {
     #[tokio::test]
     async fn stream_cases() {
         let mut theirs = Handshake::new([1; 20], [3; 20]);
-        theirs.reserved[5] = 0x10;
+        assert!(theirs.supports_extensions());
+        theirs.reserved = [0; 8];
+        assert!(!theirs.supports_extensions());
 
         let (mut local, mut remote) = duplex(256);
         theirs.write_to(&mut local).await.unwrap();
