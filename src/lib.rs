@@ -1,4 +1,5 @@
 pub mod bencode;
+pub mod dht;
 pub mod peer;
 pub mod session;
 pub mod storage;

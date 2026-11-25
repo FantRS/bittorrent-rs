@@ -31,6 +31,7 @@ pub enum Message {
     Request(Request),
     Piece(Piece),
     Cancel(Request),
+    Port(u16),
     Extended { id: u8, payload: Bytes },
 }
 
@@ -76,6 +77,7 @@ impl Decoder for MessageCodec {
                 block: mem::take(&mut payload),
             }),
             8 => Message::Cancel(Request::decode(&mut payload)?),
+            9 => Message::Port(payload.try_get_u16()?),
             20 => Message::Extended {
                 id: payload.try_get_u8()?,
                 payload: mem::take(&mut payload),
@@ -115,6 +117,7 @@ impl Encoder<Message> for MessageCodec {
                 ],
             ),
             Message::Cancel(request) => put_frame(dst, 8, &[request.to_bytes().as_flattened()]),
+            Message::Port(port) => put_frame(dst, 9, &[&port.to_be_bytes()]),
             Message::Extended { id, payload } => put_frame(dst, 20, &[&[id], &payload]),
         }
     }
@@ -179,6 +182,7 @@ mod tests {
                 block: Bytes::from_static(b"block"),
             }),
             Message::Cancel(request),
+            Message::Port(6881),
             Message::Extended {
                 id: 1,
                 payload: Bytes::from_static(b"d5:addede"),

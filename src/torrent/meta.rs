@@ -43,7 +43,6 @@ impl TryFrom<BencodeValue> for TorrentMeta {
         if trackers.is_empty() {
             trackers.extend(dict.take_opt::<String>("announce"));
         }
-        ensure!(!trackers.is_empty(), "Torrent has no trackers");
 
         Ok(Self {
             trackers,
@@ -281,7 +280,7 @@ mod tests {
             trackers("8:announce5:http113:announce-listle").unwrap(),
             ["http1"]
         );
-        assert!(trackers("").is_err());
+        assert!(trackers("").unwrap().is_empty());
     }
 
     #[test]

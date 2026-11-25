@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use bitvec::prelude::BitVec;
-use futures_util::future::join_all;
+use futures_util::future::{join, join_all};
 use sha1::{Digest, Sha1};
 use std::convert::Infallible;
 use std::future;
@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::dht::Dht;
 use crate::peer::{METADATA_PIECE_LEN, PeerConnection};
 use crate::torrent::{Magnet, Torrent};
 use crate::tracker::{Announce, announce_periodically};
@@ -23,10 +24,15 @@ const PEER_BUFFER: usize = 16;
 const UNKNOWN_LEFT: u64 = 1 << 14;
 const REQUEST_WINDOW: usize = 8;
 
-pub async fn resolve(magnet: &Magnet, peer_id: [u8; 20], port: u16) -> Result<Torrent> {
+pub async fn resolve(
+    magnet: &Magnet,
+    peer_id: [u8; 20],
+    port: u16,
+    dht: Option<&Dht>,
+) -> Result<Torrent> {
     ensure!(
-        !magnet.trackers.is_empty() || !magnet.peers.is_empty(),
-        "Magnet link has no trackers or peers"
+        !magnet.trackers.is_empty() || !magnet.peers.is_empty() || dht.is_some(),
+        "Magnet link has no trackers or peers, and DHT is unavailable"
     );
     info!(
         "Fetching metadata for {}",
@@ -45,13 +51,17 @@ pub async fn resolve(magnet: &Magnet, peer_id: [u8; 20], port: u16) -> Result<To
     let (sender, peers) = mpsc::channel(PEER_BUFFER);
     sender.try_send(lookup(&magnet.peers).await)?;
     let announcing = async move {
-        join_all(
-            magnet
-                .trackers
-                .iter()
-                .map(|tracker| announce_periodically(tracker, request, &sender)),
-        )
-        .await;
+        let trackers = magnet
+            .trackers
+            .iter()
+            .map(|tracker| announce_periodically(tracker, request, &sender));
+        let dht = async {
+            if let Some(dht) = dht {
+                dht.announce_periodically(magnet.info_hash, port, &sender)
+                    .await;
+            }
+        };
+        join(join_all(trackers), dht).await;
         drop(sender);
         future::pending::<Infallible>().await
     };
@@ -291,16 +301,24 @@ mod tests {
             peers,
         };
 
-        let torrent = resolve(&magnet(vec![format!("localhost:{port}")]), [2; 20], 0)
+        let torrent = resolve(&magnet(vec![format!("localhost:{port}")]), [2; 20], 0, None)
             .await
             .unwrap();
         assert_eq!(torrent.info_hash, info_hash);
         assert!(torrent.meta.trackers.is_empty());
 
-        assert!(resolve(&magnet(Vec::new()), [2; 20], 0).await.is_err());
+        assert!(
+            resolve(&magnet(Vec::new()), [2; 20], 0, None)
+                .await
+                .is_err()
+        );
 
         let forged = spawn_peer(info_hash, Bytes::from_static(b"de")).await;
         let unreachable = vec![forged.to_string(), "unresolvable.invalid:1".into()];
-        assert!(resolve(&magnet(unreachable), [2; 20], 0).await.is_err());
+        assert!(
+            resolve(&magnet(unreachable), [2; 20], 0, None)
+                .await
+                .is_err()
+        );
     }
 }

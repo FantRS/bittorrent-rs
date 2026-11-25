@@ -5,14 +5,17 @@ pub use client::Client;
 use anyhow::{Context, Result, ensure};
 use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
-use futures_util::future::join_all;
+use futures_util::future::{join, join_all};
 use parking_lot::RwLock;
 use rayon::prelude::*;
+use std::convert::Infallible;
+use std::future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::dht::Dht;
 use crate::peer::Request;
 use crate::storage::{ResumeData, Storage};
 use crate::torrent::Torrent;
@@ -147,11 +150,27 @@ impl Session {
         }
     }
 
-    pub async fn run_announcer(&self, port: u16, peers: mpsc::Sender<Vec<SocketAddr>>) {
+    pub async fn run_announcer(
+        &self,
+        port: u16,
+        peers: mpsc::Sender<Vec<SocketAddr>>,
+        dht: Option<&Dht>,
+    ) -> Infallible {
         let request = |event| self.announce(port, event);
         let trackers = self.torrent.meta.trackers.iter();
+        let dht = async {
+            if let Some(dht) = dht {
+                dht.announce_periodically(self.torrent.info_hash, port, &peers)
+                    .await;
+            }
+        };
 
-        join_all(trackers.map(|tracker| announce_periodically(tracker, request, &peers))).await;
+        join(
+            join_all(trackers.map(|tracker| announce_periodically(tracker, request, &peers))),
+            dht,
+        )
+        .await;
+        future::pending().await
     }
 
     fn left(&self) -> u64 {

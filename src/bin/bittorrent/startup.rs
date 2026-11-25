@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use bittorrent_rs::dht::Dht;
 use bittorrent_rs::session::{Client, Session};
 use bittorrent_rs::storage::{ResumeData, Storage};
 use bittorrent_rs::torrent::{Magnet, Torrent};
@@ -30,7 +31,10 @@ pub async fn start() -> Result<()> {
 
     let client = Client::build()?;
     let port = client.port()?;
-    let torrent = load(&args.path, &client, port).await?;
+    let dht = Dht::start()
+        .inspect_err(|e| warn!("DHT is unavailable: {e:#}"))
+        .ok();
+    let torrent = load(&args.path, &client, port, dht.as_ref()).await?;
     let resume_path = args
         .output
         .join(format!("{}.fastresume", torrent.meta.info.name));
@@ -49,7 +53,7 @@ pub async fn start() -> Result<()> {
         );
     }
 
-    let result = run(&session, &client, port).await;
+    let result = run(&session, &client, port, dht.as_ref()).await;
 
     if let Err(e) = save(&session, &resume_path).await {
         warn!("Failed to save fastresume data: {e:#}");
@@ -59,14 +63,14 @@ pub async fn start() -> Result<()> {
     result
 }
 
-async fn load(source: &str, client: &Client, port: u16) -> Result<Torrent> {
+async fn load(source: &str, client: &Client, port: u16, dht: Option<&Dht>) -> Result<Torrent> {
     if !source.starts_with("magnet:") {
         return Torrent::load(source);
     }
 
     let magnet: Magnet = source.parse()?;
     tokio::select! {
-        torrent = resolve(&magnet, client.id, port) => torrent,
+        torrent = resolve(&magnet, client.id, port, dht) => torrent,
         result = signal::ctrl_c() => {
             result?;
             bail!("Interrupted while fetching metadata")
@@ -74,7 +78,7 @@ async fn load(source: &str, client: &Client, port: u16) -> Result<Torrent> {
     }
 }
 
-async fn run(session: &Arc<Session>, client: &Client, port: u16) -> Result<()> {
+async fn run(session: &Arc<Session>, client: &Client, port: u16, dht: Option<&Dht>) -> Result<()> {
     let already_complete = session.is_complete();
     let progress = ProgressBar::new(session.torrent.meta.info.length)
         .with_position(session.verified_bytes())
@@ -83,13 +87,13 @@ async fn run(session: &Arc<Session>, client: &Client, port: u16) -> Result<()> {
         )?);
 
     let (peers_sender, peers) = mpsc::channel(PEER_QUEUE);
-    let announcing = session.run_announcer(port, peers_sender.clone());
+    let announcing = session.run_announcer(port, peers_sender.clone(), dht);
     let downloading = download(Arc::clone(session), peers, |len| progress.inc(len));
     let seeding = seed(Arc::clone(session), &client.lst, peers_sender);
     tokio::pin!(announcing, seeding);
 
     tokio::select! {
-        () = &mut announcing => {}
+        never = &mut announcing => match never {},
         result = &mut seeding => result?,
         result = downloading => {
             result?;
@@ -100,7 +104,7 @@ async fn run(session: &Arc<Session>, client: &Client, port: u16) -> Result<()> {
             info!("Download complete, seeding until Ctrl+C");
 
             tokio::select! {
-                () = announcing => {}
+                never = announcing => match never {},
                 result = seeding => result?,
                 result = signal::ctrl_c() => result?,
             }
