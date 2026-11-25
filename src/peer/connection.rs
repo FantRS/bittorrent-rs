@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use bitvec::prelude::{BitVec, Msb0};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
@@ -11,7 +11,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::codec::Framed;
 use tracing::debug;
 
-use crate::peer::extension;
+use crate::peer::extension::{self, MetadataMessage, RemoteExtensions};
 use crate::peer::{Handshake, Message, MessageCodec, Request};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,7 +27,8 @@ pub struct PeerConnection {
     am_interested: bool,
     peer_choking: bool,
     peer_interested: bool,
-    pieces: BitVec<u8, Msb0>,
+    pieces: Option<BitVec<u8, Msb0>>,
+    remote: Option<RemoteExtensions>,
     exchanged: Option<mpsc::Sender<Vec<SocketAddr>>>,
 }
 
@@ -36,7 +37,7 @@ impl PeerConnection {
         addr: impl Into<SocketAddr>,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
-        piece_count: usize,
+        piece_count: Option<usize>,
     ) -> Result<Self> {
         let addr = addr.into();
 
@@ -70,12 +71,17 @@ impl PeerConnection {
                 .write_to(&mut stream)
                 .await?;
 
-            Ok(Self::new(addr, theirs, stream, piece_count))
+            Ok(Self::new(addr, theirs, stream, Some(piece_count)))
         })
         .await
     }
 
-    fn new(addr: SocketAddr, handshake: Handshake, stream: TcpStream, piece_count: usize) -> Self {
+    fn new(
+        addr: SocketAddr,
+        handshake: Handshake,
+        stream: TcpStream,
+        piece_count: Option<usize>,
+    ) -> Self {
         Self {
             addr,
             handshake,
@@ -83,7 +89,8 @@ impl PeerConnection {
             am_interested: false,
             peer_choking: true,
             peer_interested: false,
-            pieces: BitVec::repeat(false, piece_count),
+            pieces: piece_count.map(|count| BitVec::repeat(false, count)),
+            remote: None,
             exchanged: None,
         }
     }
@@ -97,7 +104,7 @@ impl PeerConnection {
         &mut self,
         exchanged: mpsc::Sender<Vec<SocketAddr>>,
     ) -> Result<()> {
-        if self.handshake.supports_extensions() {
+        if self.supports_extensions() {
             self.send(Message::Extended {
                 id: extension::HANDSHAKE,
                 payload: extension::handshake(),
@@ -121,12 +128,65 @@ impl PeerConnection {
 
     #[must_use]
     pub fn has_piece(&self, index: usize) -> bool {
-        self.pieces.get(index).is_some_and(|bit| *bit)
+        self.pieces
+            .as_ref()
+            .and_then(|pieces| pieces.get(index))
+            .is_some_and(|bit| *bit)
     }
 
     #[must_use]
     pub fn has_any_piece(&self) -> bool {
-        self.pieces.any()
+        self.pieces.as_ref().is_some_and(|pieces| pieces.any())
+    }
+
+    #[must_use]
+    pub fn supports_extensions(&self) -> bool {
+        self.handshake.supports_extensions()
+    }
+
+    pub async fn metadata_size(&mut self) -> Result<usize> {
+        loop {
+            match self.remote {
+                Some(RemoteExtensions {
+                    ut_metadata: None, ..
+                }) => bail!("Peer does not support ut_metadata"),
+                Some(RemoteExtensions {
+                    metadata_size: Some(size),
+                    ..
+                }) => return Ok(size),
+                _ => {}
+            }
+            self.recv().await?;
+        }
+    }
+
+    pub async fn request_metadata(&mut self, piece: u32) -> Result<()> {
+        let id = self
+            .remote
+            .and_then(|remote| remote.ut_metadata)
+            .context("Peer does not support ut_metadata")?;
+
+        self.send(Message::Extended {
+            id,
+            payload: MetadataMessage::Request(piece).encode(),
+        })
+        .await
+    }
+
+    pub async fn recv_metadata(&mut self) -> Result<(u32, Bytes)> {
+        loop {
+            if let Message::Extended {
+                id: extension::UT_METADATA,
+                payload,
+            } = self.recv().await?
+            {
+                match MetadataMessage::decode(&payload)? {
+                    MetadataMessage::Data { piece, block } => return Ok((piece, block)),
+                    MetadataMessage::Reject(piece) => bail!("Peer rejected metadata piece {piece}"),
+                    MetadataMessage::Request(_) => {}
+                }
+            }
+        }
     }
 
     pub async fn interested(&mut self) -> Result<()> {
@@ -155,21 +215,46 @@ impl PeerConnection {
             Message::Interested => self.peer_interested = true,
             Message::NotInterested => self.peer_interested = false,
             Message::Have(index) => {
-                let mut bit = usize::try_from(*index)
-                    .ok()
-                    .and_then(|index| self.pieces.get_mut(index))
-                    .ok_or_else(|| anyhow!("Invalid piece index: {index}"))?;
-                *bit = true;
+                if let Some(pieces) = &mut self.pieces {
+                    let mut bit = usize::try_from(*index)
+                        .ok()
+                        .and_then(|index| pieces.get_mut(index))
+                        .ok_or_else(|| anyhow!("Invalid piece index: {index}"))?;
+                    *bit = true;
+                }
             }
             Message::Bitfield(bits) => {
-                let piece_count = self.pieces.len();
-                ensure!(
-                    bits.len() == piece_count.div_ceil(8),
-                    "Invalid bitfield length: {}",
-                    bits.len()
-                );
-                self.pieces = BitVec::from_slice(bits);
-                self.pieces.truncate(piece_count);
+                if let Some(pieces) = &mut self.pieces {
+                    let piece_count = pieces.len();
+                    ensure!(
+                        bits.len() == piece_count.div_ceil(8),
+                        "Invalid bitfield length: {}",
+                        bits.len()
+                    );
+                    *pieces = BitVec::from_slice(bits);
+                    pieces.truncate(piece_count);
+                }
+            }
+            Message::Extended {
+                id: extension::HANDSHAKE,
+                payload,
+            } => match extension::parse_handshake(payload) {
+                Ok(remote) => self.remote = Some(remote),
+                Err(e) => debug!("{}: invalid extension handshake: {e:#}", self.addr),
+            },
+            Message::Extended {
+                id: extension::UT_METADATA,
+                payload,
+            } => {
+                if let Ok(MetadataMessage::Request(piece)) = MetadataMessage::decode(payload)
+                    && let Some(id) = self.remote.and_then(|remote| remote.ut_metadata)
+                {
+                    self.send(Message::Extended {
+                        id,
+                        payload: MetadataMessage::Reject(piece).encode(),
+                    })
+                    .await?;
+                }
             }
             Message::Extended {
                 id: extension::UT_PEX,
@@ -274,7 +359,7 @@ mod tests {
         let our_id = *b"-RS0001-abcdefghijkl";
         let their_id = *b"-XX0001-000000000000";
         let data: Bytes = (0..=u8::MAX).cycle().take(80_000).collect();
-        let connect = |addr| PeerConnection::connect(addr, info_hash, our_id, 2);
+        let connect = |addr| PeerConnection::connect(addr, info_hash, our_id, Some(2));
         let seeder = |hash| Some(Handshake::new(hash, their_id));
 
         let addr = spawn_seeder(seeder(info_hash), &[0b0100_0000], data.clone(), 40_000).await;
@@ -339,7 +424,7 @@ mod tests {
             (ours.supports_extensions(), handshake)
         });
 
-        let mut conn = PeerConnection::connect(addr, info_hash, [2; 20], 1)
+        let mut conn = PeerConnection::connect(addr, info_hash, [2; 20], Some(1))
             .await
             .unwrap();
         let (sender, mut receiver) = mpsc::channel(4);

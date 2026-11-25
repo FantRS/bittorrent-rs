@@ -29,6 +29,11 @@ impl BencodeParser {
     }
 
     #[must_use]
+    pub fn consumed(&self) -> usize {
+        self.cursor
+    }
+
+    #[must_use]
     pub fn info_hash(&self) -> Option<[u8; 20]> {
         let (start, end) = self.info_span?;
 

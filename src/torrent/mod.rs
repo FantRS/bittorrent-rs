@@ -1,5 +1,7 @@
+pub mod magnet;
 pub mod meta;
 
+pub use magnet::Magnet;
 pub use meta::{FileEntry, TorrentInfo, TorrentMeta};
 
 use anyhow::{Result, anyhow};
@@ -28,5 +30,17 @@ impl Torrent {
             .ok_or_else(|| anyhow!("Info hash getting error"))?;
 
         Ok(Self { meta, info_hash })
+    }
+
+    pub fn from_metadata(magnet: &Magnet, metadata: Vec<u8>) -> Result<Self> {
+        let info = BencodeParser::new(metadata).parse()?.try_into()?;
+
+        Ok(Self {
+            meta: TorrentMeta {
+                trackers: magnet.trackers.clone(),
+                info,
+            },
+            info_hash: magnet.info_hash,
+        })
     }
 }

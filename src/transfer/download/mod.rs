@@ -2,65 +2,22 @@ mod picker;
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{self, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::peer::PeerConnection;
 use crate::session::Session;
+use crate::transfer::swarm::Swarm;
 use picker::Picker;
 
 const IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 const PIECE_BUFFER: usize = 16;
 const EXCHANGE_BUFFER: usize = 64;
 const MAX_PEERS: usize = 50;
-const RETRY_DELAY: Duration = Duration::from_mins(5);
-
-#[derive(Debug, Default)]
-struct Swarm {
-    active: HashMap<task::Id, SocketAddr>,
-    queued: VecDeque<SocketAddr>,
-    known: HashMap<SocketAddr, Option<Instant>>,
-}
-
-impl Swarm {
-    fn enqueue(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) {
-        for addr in addrs {
-            let busy = match self.known.get(&addr) {
-                Some(None) => true,
-                Some(Some(left)) => left.elapsed() < RETRY_DELAY,
-                None => false,
-            };
-            if !busy {
-                self.known.insert(addr, None);
-                self.queued.push_back(addr);
-            }
-        }
-    }
-
-    fn next(&mut self) -> Option<SocketAddr> {
-        if self.active.len() < MAX_PEERS {
-            self.queued.pop_front()
-        } else {
-            None
-        }
-    }
-
-    fn finished(&mut self, id: task::Id) {
-        if let Some(addr) = self.active.remove(&id) {
-            self.known.insert(addr, Some(Instant::now()));
-        }
-    }
-
-    fn is_idle(&self) -> bool {
-        self.active.is_empty() && self.queued.is_empty()
-    }
-}
 
 pub async fn download(
     session: Arc<Session>,
@@ -72,22 +29,20 @@ pub async fn download(
     let picker = Arc::new(Picker::new(missing));
     let (sender, mut pieces) = mpsc::channel::<(u32, Bytes)>(PIECE_BUFFER);
     let (exchange, mut exchanged) = mpsc::channel(EXCHANGE_BUFFER);
-    let mut swarm = Swarm::default();
-    let mut tasks = JoinSet::new();
+    let mut swarm = Swarm::new(MAX_PEERS);
 
     while remaining > 0 {
-        while let Some(addr) = swarm.next() {
-            let peer = run_peer(
+        swarm.spawn_queued(|addr| {
+            run_peer(
                 addr,
                 Arc::clone(&session),
                 Arc::clone(&picker),
                 sender.clone(),
                 exchange.clone(),
-            );
-            swarm.active.insert(tasks.spawn(peer).id(), addr);
-        }
+            )
+        });
 
-        if tasks.is_empty()
+        if !swarm.has_tasks()
             && pieces.is_empty()
             && exchanged.is_empty()
             && peers.is_closed()
@@ -105,12 +60,7 @@ pub async fn download(
             }
             Some(addrs) = peers.recv() => swarm.enqueue(addrs),
             Some(addrs) = exchanged.recv() => swarm.enqueue(addrs),
-            Some(joined) = tasks.join_next_with_id() => {
-                let (id, result) = match joined {
-                    Ok((id, result)) => (id, result),
-                    Err(e) => (e.id(), Err(e.into())),
-                };
-                swarm.finished(id);
+            Some(result) = swarm.join_next() => {
                 if let Err(e) = result {
                     debug!("{e:#}");
                 }
@@ -134,7 +84,7 @@ async fn run_peer(
     let info = &session.torrent.meta.info;
     let info_hash = session.torrent.info_hash;
     let mut conn =
-        PeerConnection::connect(addr, info_hash, session.peer_id, info.piece_count()).await?;
+        PeerConnection::connect(addr, info_hash, session.peer_id, Some(info.piece_count())).await?;
     info!(
         "{addr}: connected ({})",
         String::from_utf8_lossy(&conn.peer_id())
@@ -228,29 +178,6 @@ mod tests {
         };
 
         Arc::new(Session::new(torrent, peer_id, storage))
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn swarm_cases() {
-        let addr: SocketAddr = "1.2.3.4:5".parse().unwrap();
-        let mut swarm = Swarm::default();
-        swarm.enqueue([addr, addr]);
-        assert_eq!(swarm.next(), Some(addr));
-        assert_eq!(swarm.next(), None);
-
-        let id = tokio::spawn(async {}).id();
-        swarm.active.insert(id, addr);
-        swarm.enqueue([addr]);
-        assert_eq!(swarm.next(), None);
-
-        swarm.finished(id);
-        assert!(swarm.is_idle());
-        swarm.enqueue([addr]);
-        assert_eq!(swarm.next(), None);
-
-        tokio::time::advance(RETRY_DELAY).await;
-        swarm.enqueue([addr]);
-        assert_eq!(swarm.next(), Some(addr));
     }
 
     #[tokio::test]

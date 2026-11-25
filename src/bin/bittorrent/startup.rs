@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use std::sync::Arc;
@@ -9,8 +9,9 @@ use tracing_subscriber::EnvFilter;
 
 use bittorrent_rs::session::{Client, Session};
 use bittorrent_rs::storage::{ResumeData, Storage};
-use bittorrent_rs::torrent::Torrent;
+use bittorrent_rs::torrent::{Magnet, Torrent};
 use bittorrent_rs::tracker::{Event, announce_all};
+use bittorrent_rs::transfer::metadata::resolve;
 use bittorrent_rs::transfer::{download, seed};
 
 use crate::args::Args;
@@ -27,13 +28,13 @@ pub async fn start() -> Result<()> {
 
     let args = Args::get();
 
-    let torrent = Torrent::load(args.path)?;
+    let client = Client::build()?;
+    let port = client.port()?;
+    let torrent = load(&args.path, &client, port).await?;
     let resume_path = args
         .output
         .join(format!("{}.fastresume", torrent.meta.info.name));
     let storage = Storage::create(&args.output, &torrent.meta.info).await?;
-    let client = Client::build()?;
-    let port = client.port()?;
     let session = Arc::new(Session::new(torrent, client.id, storage));
 
     let saved = ResumeData::load(&resume_path)
@@ -56,6 +57,21 @@ pub async fn start() -> Result<()> {
     announce(&session, port, Event::Stopped).await;
 
     result
+}
+
+async fn load(source: &str, client: &Client, port: u16) -> Result<Torrent> {
+    if !source.starts_with("magnet:") {
+        return Torrent::load(source);
+    }
+
+    let magnet: Magnet = source.parse()?;
+    tokio::select! {
+        torrent = resolve(&magnet, client.id, port) => torrent,
+        result = signal::ctrl_c() => {
+            result?;
+            bail!("Interrupted while fetching metadata")
+        }
+    }
 }
 
 async fn run(session: &Arc<Session>, client: &Client, port: u16) -> Result<()> {

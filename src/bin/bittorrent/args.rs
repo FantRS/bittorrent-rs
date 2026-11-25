@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(version)]
 pub struct Args {
-    /// Full path to .torrent file in your PC
+    /// Path to a .torrent file or a magnet link
     #[arg(short, long)]
     pub path: String,
 
