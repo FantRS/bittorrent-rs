@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::task::{self, JoinSet};
+use tokio::task::{self, AbortHandle, JoinSet};
 use tokio::time::Instant;
 
 const RETRY_DELAY: Duration = Duration::from_mins(5);
@@ -11,7 +11,7 @@ const RETRY_DELAY: Duration = Duration::from_mins(5);
 pub struct Swarm<T> {
     limit: usize,
     tasks: JoinSet<Result<T>>,
-    active: HashMap<task::Id, SocketAddr>,
+    active: HashMap<task::Id, (SocketAddr, AbortHandle)>,
     queued: VecDeque<SocketAddr>,
     known: HashMap<SocketAddr, Contact>,
 }
@@ -20,6 +20,7 @@ pub struct Swarm<T> {
 enum Contact {
     Pending,
     Left(Instant),
+    Banned,
 }
 
 impl<T: Send + 'static> Swarm<T> {
@@ -36,7 +37,7 @@ impl<T: Send + 'static> Swarm<T> {
     pub fn enqueue(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) {
         for addr in addrs {
             let busy = match self.known.get(&addr) {
-                Some(Contact::Pending) => true,
+                Some(Contact::Pending | Contact::Banned) => true,
                 Some(Contact::Left(at)) => at.elapsed() < RETRY_DELAY,
                 None => false,
             };
@@ -54,8 +55,8 @@ impl<T: Send + 'static> Swarm<T> {
         while self.active.len() < self.limit
             && let Some(addr) = self.queued.pop_front()
         {
-            let id = self.tasks.spawn(connect(addr)).id();
-            self.active.insert(id, addr);
+            let handle = self.tasks.spawn(connect(addr));
+            self.active.insert(handle.id(), (addr, handle));
         }
     }
 
@@ -64,11 +65,20 @@ impl<T: Send + 'static> Swarm<T> {
             Ok((id, result)) => (id, result),
             Err(e) => (e.id(), Err(e.into())),
         };
-        if let Some(addr) = self.active.remove(&id) {
+        if let Some((addr, _)) = self.active.remove(&id)
+            && !matches!(self.known.get(&addr), Some(Contact::Banned))
+        {
             self.known.insert(addr, Contact::Left(Instant::now()));
         }
 
         Some(result)
+    }
+
+    pub fn ban(&mut self, addr: SocketAddr) {
+        self.known.insert(addr, Contact::Banned);
+        if let Some((_, handle)) = self.active.values().find(|(active, _)| *active == addr) {
+            handle.abort();
+        }
     }
 
     pub fn has_tasks(&self) -> bool {
@@ -118,5 +128,13 @@ mod tests {
         swarm.spawn_queued(&mut connect);
         assert!(swarm.join_next().await.unwrap().is_err());
         assert_eq!(spawned, [addr, other, other]);
+
+        swarm.enqueue([addr]);
+        swarm.spawn_queued(|_| std::future::pending());
+        swarm.ban(addr);
+        assert!(swarm.join_next().await.unwrap().is_err());
+        tokio::time::advance(RETRY_DELAY).await;
+        swarm.enqueue([addr]);
+        assert!(swarm.is_idle());
     }
 }

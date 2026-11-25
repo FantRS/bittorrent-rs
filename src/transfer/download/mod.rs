@@ -1,25 +1,40 @@
+mod assembler;
 mod picker;
 
-use anyhow::{Context, Result, bail, ensure};
-use bytes::Bytes;
+use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::cpu;
-use crate::peer::PeerConnection;
+use crate::peer::{Message, PeerConnection};
 use crate::session::Session;
-use crate::torrent::PieceIndex;
+use crate::torrent::TorrentInfo;
 use crate::transfer::swarm::Swarm;
-use picker::Picker;
+use assembler::{Assembled, Assembler};
+use picker::{Picker, Reservation};
 
 const IDLE_TIMEOUT: Duration = Duration::from_mins(2);
+const STALL_TIMEOUT: Duration = Duration::from_mins(1);
 const PIECE_BUFFER: usize = 16;
 const EXCHANGE_BUFFER: usize = 64;
 const MAX_PEERS: usize = 50;
+
+#[derive(Debug)]
+struct Downloaded {
+    addr: SocketAddr,
+    piece: Assembled,
+}
+
+#[derive(Debug)]
+enum Verdict {
+    Stored(u64),
+    Corrupt(SocketAddr),
+}
 
 pub async fn download(
     session: Arc<Session>,
@@ -29,9 +44,10 @@ pub async fn download(
     let missing = session.missing();
     let mut remaining = missing.count_ones();
     let picker = Arc::new(Picker::new(missing));
-    let (sender, mut pieces) = mpsc::channel::<(PieceIndex, Bytes)>(PIECE_BUFFER);
+    let (sender, mut downloaded) = mpsc::channel::<Downloaded>(PIECE_BUFFER);
     let (exchange, mut exchanged) = mpsc::channel(EXCHANGE_BUFFER);
     let mut swarm = Swarm::new(MAX_PEERS);
+    let mut verifying = JoinSet::new();
 
     while remaining > 0 {
         swarm.spawn_queued(|addr| {
@@ -45,7 +61,8 @@ pub async fn download(
         });
 
         if !swarm.has_tasks()
-            && pieces.is_empty()
+            && verifying.is_empty()
+            && downloaded.is_empty()
             && exchanged.is_empty()
             && peers.is_closed()
             && peers.is_empty()
@@ -54,12 +71,19 @@ pub async fn download(
         }
 
         tokio::select! {
-            Some((index, piece)) = pieces.recv() => {
-                let len = u64::try_from(piece.len())?;
-                session.store_piece(index, piece).await?;
-                remaining -= 1;
-                on_piece(len);
+            Some(Downloaded { addr, piece }) = downloaded.recv() => {
+                verifying.spawn(store(Arc::clone(&session), addr, piece));
             }
+            Some(verdict) = verifying.join_next() => match verdict?? {
+                Verdict::Stored(len) => {
+                    remaining -= 1;
+                    on_piece(len);
+                }
+                Verdict::Corrupt(addr) => {
+                    warn!("{addr}: sent a corrupt piece, banning");
+                    swarm.ban(addr);
+                }
+            },
             Some(addrs) = peers.recv() => swarm.enqueue(addrs),
             Some(addrs) = exchanged.recv() => swarm.enqueue(addrs),
             Some(result) = swarm.join_next() => {
@@ -76,64 +100,98 @@ pub async fn download(
     Ok(())
 }
 
+async fn store(session: Arc<Session>, addr: SocketAddr, piece: Assembled) -> Result<Verdict> {
+    let Assembled { reservation, data } = piece;
+    let index = reservation.index();
+
+    let checked = Arc::clone(&session);
+    let block = data.clone();
+    if !cpu::spawn(move || checked.torrent.meta.info.verify(index, &block)).await? {
+        return Ok(Verdict::Corrupt(addr));
+    }
+
+    let len = u64::try_from(data.len())?;
+    session.store_piece(index, data).await?;
+    reservation.complete();
+
+    Ok(Verdict::Stored(len))
+}
+
 async fn run_peer(
     addr: SocketAddr,
     session: Arc<Session>,
     picker: Arc<Picker>,
-    pieces: mpsc::Sender<(PieceIndex, Bytes)>,
+    downloaded: mpsc::Sender<Downloaded>,
     exchange: mpsc::Sender<Vec<SocketAddr>>,
 ) -> Result<()> {
     let info = &session.torrent.meta.info;
-    let info_hash = session.torrent.info_hash;
-    let mut conn =
-        PeerConnection::connect(addr, info_hash, session.peer_id, Some(info.piece_count())).await?;
+    let mut conn = PeerConnection::connect(
+        addr,
+        session.torrent.info_hash,
+        session.peer_id,
+        Some(info.piece_count()),
+    )
+    .await?;
     info!("{addr}: connected ({})", conn.peer_id());
 
     conn.enable_extensions(exchange).await?;
     conn.interested().await?;
+    let mut assembler = Assembler::default();
     let mut released = picker.subscribe();
     let mut deadline = Instant::now() + IDLE_TIMEOUT;
 
-    while !picker.is_done() {
-        let reservation = if conn.is_choked() {
-            None
-        } else {
-            picker.reserve(|index| conn.has_piece(index))
-        };
+    loop {
+        if !conn.is_choked() {
+            let mut batch = Vec::new();
+            while assembler.pending() < conn.queue_depth()
+                && let Some(request) = assembler.next_request(|| reserve(&picker, &conn, info))
+            {
+                batch.push(request);
+            }
+            if !batch.is_empty() {
+                conn.request(&batch).await?;
+                deadline = Instant::now() + STALL_TIMEOUT;
+            }
+        }
 
-        let Some(reservation) = reservation else {
+        if assembler.is_idle() {
+            if picker.is_done() {
+                return Ok(());
+            }
             if !conn.is_choked() && picker.wants(|index| conn.has_piece(index)) {
                 deadline = Instant::now() + IDLE_TIMEOUT;
             }
-            tokio::select! {
-                message = timeout_at(deadline, conn.recv()) => {
-                    message.with_context(|| format!("{addr}: idle for too long"))??;
+        }
+
+        let was_choked = conn.is_choked();
+        tokio::select! {
+            message = timeout_at(deadline, conn.recv()) => {
+                let message = message.with_context(|| format!("{addr}: no progress for too long"))??;
+                if was_choked && !conn.is_choked() {
+                    assembler.requeue();
+                    deadline = Instant::now() + STALL_TIMEOUT;
                 }
-                _ = released.changed() => {}
+                if let Message::Piece(piece) = &message {
+                    deadline = Instant::now() + STALL_TIMEOUT;
+                    if let Some(piece) = assembler.receive(piece) {
+                        downloaded.send(Downloaded { addr, piece }).await?;
+                    }
+                }
             }
-            continue;
-        };
-
-        let index = reservation.index();
-        let length = info
-            .piece_len(index)
-            .with_context(|| format!("Invalid piece index: {index}"))?;
-        let piece = conn.download_piece(index, length).await?;
-        ensure!(
-            verify(Arc::clone(&session), index, piece.clone()).await?,
-            "{addr}: piece {index} failed hash check"
-        );
-
-        reservation.complete();
-        pieces.send((index, piece)).await?;
-        deadline = Instant::now() + IDLE_TIMEOUT;
+            _ = released.changed(), if assembler.is_idle() => {}
+        }
     }
-
-    Ok(())
 }
 
-async fn verify(session: Arc<Session>, index: PieceIndex, piece: Bytes) -> Result<bool> {
-    cpu::spawn(move || session.torrent.meta.info.verify(index, &piece)).await
+fn reserve(
+    picker: &Arc<Picker>,
+    conn: &PeerConnection,
+    info: &TorrentInfo,
+) -> Option<(Reservation, u32)> {
+    let reservation = picker.reserve(|index| conn.has_piece(index))?;
+    let length = info.piece_len(reservation.index())?;
+
+    Some((reservation, length))
 }
 
 #[cfg(test)]
@@ -144,6 +202,7 @@ mod tests {
     use crate::storage::{ResumeData, Storage};
     use crate::torrent::{Torrent, TorrentInfo, TorrentMeta};
     use crate::transfer::seed;
+    use bytes::Bytes;
     use std::path::Path;
     use std::time::SystemTime;
     use tokio::net::TcpListener;

@@ -1,7 +1,7 @@
-use std::process::ExitCode;
-
 mod args;
 mod startup;
+
+use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {

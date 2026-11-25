@@ -1,23 +1,21 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bitvec::prelude::{BitVec, Msb0};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until, timeout, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::codec::Framed;
 use tracing::debug;
 
 use crate::peer::extension::{self, MetadataMessage, RemoteExtensions};
-use crate::peer::pipeline::{BLOCK_LEN, Pipeline};
+use crate::peer::pipeline::Pipeline;
 use crate::peer::{Handshake, Message, MessageCodec, PeerId, Request};
 use crate::torrent::{InfoHash, PieceIndex};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const STALL_TIMEOUT: Duration = Duration::from_mins(1);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(90);
 
 #[derive(Debug)]
@@ -230,6 +228,7 @@ impl PeerConnection {
                     *bit = true;
                 }
             }
+            Message::Piece(piece) => self.pipeline.record_block(piece.block.len()),
             Message::Bitfield(bits) => {
                 if let Some(pieces) = &mut self.pieces {
                     let piece_count = pieces.len();
@@ -288,68 +287,19 @@ impl PeerConnection {
         Ok(message)
     }
 
-    pub async fn download_piece(&mut self, index: PieceIndex, length: u32) -> Result<Bytes> {
-        let mut queue: VecDeque<Request> = (0..length.div_ceil(BLOCK_LEN))
-            .map(|block| {
-                let begin = block * BLOCK_LEN;
-                Request {
-                    index,
-                    begin,
-                    length: BLOCK_LEN.min(length - begin),
-                }
-            })
-            .collect();
-        let mut pending = Vec::with_capacity(self.pipeline.depth());
-        let mut buf = BytesMut::zeroed(usize::try_from(length)?);
-        let mut deadline = Instant::now() + STALL_TIMEOUT;
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.pipeline.depth()
+    }
 
-        while !queue.is_empty() || !pending.is_empty() {
-            let requested = pending.len();
-            while !self.peer_choking
-                && pending.len() < self.pipeline.depth()
-                && let Some(request) = queue.pop_front()
-            {
-                self.frames.feed(Message::Request(request)).await?;
-                pending.push(request);
-            }
-            if pending.len() > requested {
-                self.frames.flush().await?;
-                self.last_sent = Instant::now();
-            }
-
-            let was_choked = self.peer_choking;
-            let message = timeout_at(deadline, self.recv())
-                .await
-                .with_context(|| format!("{}: piece {index} stalled", self.addr))??;
-
-            if was_choked && !self.peer_choking {
-                queue.extend(pending.drain(..));
-                deadline = Instant::now() + STALL_TIMEOUT;
-            }
-
-            match message {
-                Message::Piece(piece) if piece.index == index => {
-                    let Some(position) = pending.iter().position(|request| {
-                        request.begin == piece.begin
-                            && usize::try_from(request.length)
-                                .is_ok_and(|len| len == piece.block.len())
-                    }) else {
-                        continue;
-                    };
-                    pending.swap_remove(position);
-
-                    let start = usize::try_from(piece.begin)?;
-                    buf.get_mut(start..start + piece.block.len())
-                        .context("Block out of piece bounds")?
-                        .copy_from_slice(&piece.block);
-                    self.pipeline.record_block(piece.block.len());
-                    deadline = Instant::now() + STALL_TIMEOUT;
-                }
-                _ => {}
-            }
+    pub async fn request(&mut self, requests: &[Request]) -> Result<()> {
+        for &request in requests {
+            self.frames.feed(Message::Request(request)).await?;
         }
+        self.frames.flush().await?;
+        self.last_sent = Instant::now();
 
-        Ok(buf.freeze())
+        Ok(())
     }
 }
 
@@ -366,7 +316,9 @@ async fn with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::BLOCK_LEN;
     use crate::peer::testing::spawn_seeder;
+    use std::collections::BTreeMap;
     use tokio::net::TcpListener;
 
     #[tokio::test]
@@ -390,10 +342,39 @@ mod tests {
         assert!(conn.has_piece(1.into()));
         assert!(!conn.has_piece(0.into()));
         assert!(!conn.has_piece(2.into()));
+        let requests: Vec<Request> = (0..40_000)
+            .step_by(BLOCK_LEN as usize)
+            .map(|begin| Request {
+                index: 1.into(),
+                begin,
+                length: BLOCK_LEN.min(40_000 - begin),
+            })
+            .collect();
+
+        conn.request(&requests).await.unwrap();
+        let mut blocks = BTreeMap::new();
+
+        while blocks.len() < requests.len() {
+            match conn.recv().await.unwrap() {
+                Message::Piece(piece) => {
+                    blocks.insert(piece.begin, piece.block);
+                }
+                Message::Unchoke => {
+                    let missing: Vec<Request> = requests
+                        .iter()
+                        .filter(|request| !blocks.contains_key(&request.begin))
+                        .copied()
+                        .collect();
+                    conn.request(&missing).await.unwrap();
+                }
+                _ => {}
+            }
+        }
         assert_eq!(
-            conn.download_piece(1.into(), 40_000).await.unwrap(),
+            blocks.values().flatten().copied().collect::<Bytes>(),
             data.slice(40_000..)
         );
+        assert!(conn.queue_depth() > 5);
 
         let addr = spawn_seeder(seeder([9; 20].into()), &[0], Bytes::new(), 0).await;
         assert!(connect(addr).await.is_err());

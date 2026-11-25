@@ -1,5 +1,4 @@
 pub mod bencode;
-mod cpu;
 pub mod dht;
 pub mod discovery;
 pub mod peer;
@@ -8,3 +7,5 @@ pub mod storage;
 pub mod torrent;
 pub mod tracker;
 pub mod transfer;
+
+mod cpu;
