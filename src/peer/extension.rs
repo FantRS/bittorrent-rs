@@ -9,6 +9,7 @@ pub const HANDSHAKE: u8 = 0;
 pub const UT_PEX: u8 = 1;
 pub const UT_METADATA: u8 = 2;
 pub const METADATA_PIECE_LEN: usize = 1 << 14;
+pub const REQQ: u8 = 250;
 
 const METADATA_REQUEST: u8 = 0;
 const METADATA_DATA: u8 = 1;
@@ -18,6 +19,7 @@ const METADATA_REJECT: u8 = 2;
 pub struct RemoteExtensions {
     pub ut_metadata: Option<u8>,
     pub metadata_size: Option<usize>,
+    pub reqq: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +37,10 @@ pub fn handshake() -> Bytes {
             BencodeValue::Int(UT_METADATA.into()),
         ),
     ]);
-    let handshake = Dict::from([(b"m".to_vec(), BencodeValue::Dict(extensions))]);
+    let handshake = Dict::from([
+        (b"m".to_vec(), BencodeValue::Dict(extensions)),
+        (b"reqq".to_vec(), BencodeValue::Int(REQQ.into())),
+    ]);
 
     BencodeValue::Dict(handshake).encode().into()
 }
@@ -52,6 +57,9 @@ pub fn parse_handshake(payload: &[u8]) -> Result<RemoteExtensions> {
         metadata_size: dict
             .take_opt::<u64>("metadata_size")
             .and_then(|size| usize::try_from(size).ok()),
+        reqq: dict
+            .take_opt::<u64>("reqq")
+            .and_then(|reqq| usize::try_from(reqq).ok()),
     })
 }
 
@@ -114,12 +122,19 @@ mod tests {
 
     #[test]
     fn handshake_cases() {
-        assert_eq!(&handshake()[..], b"d1:md11:ut_metadatai2e6:ut_pexi1eee");
         assert_eq!(
-            parse_handshake(b"d1:md11:ut_metadatai3e6:ut_pexi1ee13:metadata_sizei31235ee").unwrap(),
+            &handshake()[..],
+            b"d1:md11:ut_metadatai2e6:ut_pexi1ee4:reqqi250ee"
+        );
+        assert_eq!(
+            parse_handshake(
+                b"d1:md11:ut_metadatai3e6:ut_pexi1ee13:metadata_sizei31235e4:reqqi500ee"
+            )
+            .unwrap(),
             RemoteExtensions {
                 ut_metadata: Some(3),
-                metadata_size: Some(31235)
+                metadata_size: Some(31235),
+                reqq: Some(500),
             }
         );
         assert_eq!(

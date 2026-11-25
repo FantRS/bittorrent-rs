@@ -4,6 +4,7 @@ pub(crate) mod extension;
 mod handshake;
 mod message;
 mod peer_id;
+mod pipeline;
 #[cfg(test)]
 pub(crate) mod testing;
 

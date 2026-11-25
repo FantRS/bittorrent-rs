@@ -7,18 +7,18 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::codec::Framed;
 use tracing::debug;
 
 use crate::peer::extension::{self, MetadataMessage, RemoteExtensions};
+use crate::peer::pipeline::{BLOCK_LEN, Pipeline};
 use crate::peer::{Handshake, Message, MessageCodec, PeerId, Request};
 use crate::torrent::{InfoHash, PieceIndex};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const BLOCK_LEN: u32 = 1 << 14;
-const MAX_PENDING_REQUESTS: usize = 5;
 const STALL_TIMEOUT: Duration = Duration::from_mins(1);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(90);
 
 #[derive(Debug)]
 pub struct PeerConnection {
@@ -31,6 +31,8 @@ pub struct PeerConnection {
     pieces: Option<BitVec<u8, Msb0>>,
     remote: Option<RemoteExtensions>,
     exchanged: Option<mpsc::Sender<Vec<SocketAddr>>>,
+    pipeline: Pipeline,
+    last_sent: Instant,
 }
 
 impl PeerConnection {
@@ -93,6 +95,8 @@ impl PeerConnection {
             pieces: piece_count.map(|count| BitVec::repeat(false, count)),
             remote: None,
             exchanged: None,
+            pipeline: Pipeline::new(),
+            last_sent: Instant::now(),
         }
     }
 
@@ -195,15 +199,23 @@ impl PeerConnection {
     }
 
     pub async fn send(&mut self, message: Message) -> Result<()> {
-        self.frames.send(message).await
+        self.frames.send(message).await?;
+        self.last_sent = Instant::now();
+
+        Ok(())
     }
 
     pub async fn recv(&mut self) -> Result<Message> {
-        let message = self
-            .frames
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("{}: connection closed", self.addr))??;
+        let message = loop {
+            tokio::select! {
+                frame = self.frames.next() => {
+                    break frame.ok_or_else(|| anyhow!("{}: connection closed", self.addr))??;
+                }
+                () = sleep_until(self.last_sent + KEEP_ALIVE_INTERVAL) => {
+                    self.send(Message::KeepAlive).await?;
+                }
+            }
+        };
 
         match &message {
             Message::Choke => self.peer_choking = true,
@@ -234,7 +246,10 @@ impl PeerConnection {
                 id: extension::HANDSHAKE,
                 payload,
             } => match extension::parse_handshake(payload) {
-                Ok(remote) => self.remote = Some(remote),
+                Ok(remote) => {
+                    self.pipeline.limit_to(remote.reqq);
+                    self.remote = Some(remote);
+                }
                 Err(e) => debug!("{}: invalid extension handshake: {e:#}", self.addr),
             },
             Message::Extended {
@@ -284,14 +299,14 @@ impl PeerConnection {
                 }
             })
             .collect();
-        let mut pending = Vec::with_capacity(MAX_PENDING_REQUESTS);
+        let mut pending = Vec::with_capacity(self.pipeline.depth());
         let mut buf = BytesMut::zeroed(usize::try_from(length)?);
         let mut deadline = Instant::now() + STALL_TIMEOUT;
 
         while !queue.is_empty() || !pending.is_empty() {
             let requested = pending.len();
             while !self.peer_choking
-                && pending.len() < MAX_PENDING_REQUESTS
+                && pending.len() < self.pipeline.depth()
                 && let Some(request) = queue.pop_front()
             {
                 self.frames.feed(Message::Request(request)).await?;
@@ -299,6 +314,7 @@ impl PeerConnection {
             }
             if pending.len() > requested {
                 self.frames.flush().await?;
+                self.last_sent = Instant::now();
             }
 
             let was_choked = self.peer_choking;
@@ -326,6 +342,7 @@ impl PeerConnection {
                     buf.get_mut(start..start + piece.block.len())
                         .context("Block out of piece bounds")?
                         .copy_from_slice(&piece.block);
+                    self.pipeline.record_block(piece.block.len());
                     deadline = Instant::now() + STALL_TIMEOUT;
                 }
                 _ => {}
